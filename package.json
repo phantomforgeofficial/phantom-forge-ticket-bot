@@ -1,18 +1,17 @@
 {
   "name": "phantom-forge-ticket-bot",
   "version": "1.0.0",
-  "description": "Phantom Forge Discord Ticket Bot",
+  "description": "Discord ticket bot met /pannel, /claim, /add, /close (discord.js v14)",
   "main": "src/index.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node src/index.js"
   },
+  "engines": {
+    "node": ">=18.17"
+  },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5",
-    "@octokit/rest": "^20.0.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "dotenv": "^16.4.5"
   }
 }
