@@ -29,13 +29,14 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // voor transcript
+    GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Channel]
 });
 
-// ====== Anti-duplicate lock per user ======
-const creatingTicketFor = new Set();
+// ====== Anti-duplicate locks ======
+const creatingTicketFor = new Set();          // per gebruiker
+const processingInteraction = new Set();      // per interaction id
 
 // ---------------- Helpers ----------------
 function topicMetaToObj(topic) {
@@ -116,22 +117,29 @@ client.once('ready', async () => {
 // ---------------- Interaction Handling ----------------
 client.on('interactionCreate', async (interaction) => {
   try {
+    // bescherm tegen dubbele verwerking van dezelfde interaction
+    const key = `${interaction.id}`;
+    if (processingInteraction.has(key)) return;
+    processingInteraction.add(key);
+
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
-      if (commandName === 'panel') return handlePanel(interaction);
-      if (commandName === 'claim') return handleClaim(interaction);
-      if (commandName === 'add') return handleAdd(interaction);
-      if (commandName === 'close') return handleClose(interaction);
+      if (commandName === 'panel') await handlePanel(interaction);
+      if (commandName === 'claim') await handleClaim(interaction);
+      if (commandName === 'add') await handleAdd(interaction);
+      if (commandName === 'close') await handleClose(interaction);
     } else if (interaction.isButton()) {
-      if (interaction.customId === 'open_ticket_btn') return handleOpenTicket(interaction);
-      if (interaction.customId === 'claim_ticket_btn') return handleClaim(interaction);
-      if (interaction.customId === 'close_ticket_btn') return handleClose(interaction);
+      if (interaction.customId === 'open_ticket_btn') await handleOpenTicket(interaction);
+      if (interaction.customId === 'claim_ticket_btn') await handleClaim(interaction);
+      if (interaction.customId === 'close_ticket_btn') await handleClose(interaction);
     }
   } catch (e) {
     console.error(e);
     const msg = { content: 'Er ging iets mis.', ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(msg).catch(() => {});
     else await interaction.reply(msg).catch(() => {});
+  } finally {
+    processingInteraction.delete(`${interaction.id}`);
   }
 });
 
@@ -158,12 +166,10 @@ async function handlePanel(interaction) {
     .setFooter({ text: panelFooterText(supportRoleId, categoryId) });
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('open_ticket_btn')
-      .setLabel('🎟️ Open Ticket')
-      .setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('open_ticket_btn').setLabel('🎟️ Open Ticket').setStyle(ButtonStyle.Secondary)
   );
 
+  // enkelvoudige send + sprake van geen extra sends
   await interaction.channel.send({ embeds: [embed], components: [row] });
   await interaction.reply({ content: 'Ticketpaneel geplaatst ✅', ephemeral: true });
 }
@@ -175,14 +181,14 @@ async function handleOpenTicket(interaction) {
   await interaction.deferReply({ ephemeral: true });
   const userId = interaction.user.id;
 
-  // ====== LOCK ======
+  // per-user lock
   if (creatingTicketFor.has(userId)) {
     return interaction.editReply({ content: 'Je ticket is al in aanmaak… ⏳' });
   }
   creatingTicketFor.add(userId);
 
   try {
-    // Sterke check: volledige fetch
+    // Sterke check: fetch ALLE kanalen (niet alleen cache)
     const allChannels = await guild.channels.fetch();
     const existing = allChannels.find(
       ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
@@ -191,25 +197,17 @@ async function handleOpenTicket(interaction) {
       return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
     }
 
-    // Panel-config
-    const embed = interaction.message.embeds?.[0];
-    const { supportRoleId, categoryId } = parseFooter(embed);
+    // Config uit het panel
+    const embedFromPanel = interaction.message.embeds?.[0];
+    const { supportRoleId, categoryId } = parseFooter(embedFromPanel);
 
     const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
 
-    // Permissies — support-rol zichtbaar & kan praten
+    // Permissies (bot + opener + support rol)
     const overwrites = [
       { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
       { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
-      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessage, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles].filter(Boolean), type: OverwriteType.Member }
-    ];
-    // Fix: SendMessages bit correct toevoegen (bovenstaande filter voor typos)
-    overwrites[2].allow = [
-      PermissionsBitField.Flags.ViewChannel,
-      PermissionsBitField.Flags.SendMessages,
-      PermissionsBitField.Flags.ManageChannels,
-      PermissionsBitField.Flags.ReadMessageHistory,
-      PermissionsBitField.Flags.AttachFiles
+      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member }
     ];
     if (supportRoleId) {
       overwrites.push({
@@ -235,35 +233,36 @@ async function handleOpenTicket(interaction) {
 
     await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
 
-    // 1) Opener + support taggen
-    if (supportRoleId) {
-      await channel.send({
-        content: `${interaction.user} <@&${supportRoleId}>`,
-        allowedMentions: { parse: [], users: [userId], roles: [supportRoleId.toString()] }
-      });
-    } else {
-      await channel.send({
-        content: `${interaction.user}`,
-        allowedMentions: { parse: [], users: [userId] }
-      });
-    }
-
-    // 2) Welkomst-embed
+    // Welkomst-embed
     const welcomeEmbed = new EmbedBuilder()
       .setColor('#8000ff')
       .setTitle('🎟️ Thanks for opening a ticket!')
       .setDescription('Support will be with you shortly 💜')
       .setFooter({ text: 'Phantom Forge Support' });
-    await channel.send({ embeds: [welcomeEmbed] });
 
-    // 3) Knoppen: Claim (Secondary) + Close (Primary ~ paars)
+    // Knoppen
     const ticketButtons = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('claim_ticket_btn').setLabel('🟣 Claim Ticket').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('close_ticket_btn').setLabel('🟪 Close Ticket').setStyle(ButtonStyle.Primary)
     );
-    await channel.send({ components: [ticketButtons] });
 
-    // Anti-spam
+    // 🔥 Alles in ÉÉN send (mention + embed + knoppen)
+    const contentParts = [];
+    contentParts.push(`${interaction.user}`);
+    if (supportRoleId) contentParts.push(`<@&${supportRoleId}>`);
+
+    await channel.send({
+      content: contentParts.join(' '),
+      allowedMentions: {
+        parse: [],
+        users: [userId],
+        roles: supportRoleId ? [supportRoleId.toString()] : []
+      },
+      embeds: [welcomeEmbed],
+      components: [ticketButtons]
+    });
+
+    // Anti-spam: iedereen dicht, opener + support open
     await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
     await channel.permissionOverwrites.edit(userId, { SendMessages: true }).catch(() => {});
     if (supportRoleId) {
@@ -275,7 +274,6 @@ async function handleOpenTicket(interaction) {
       await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' });
     } catch {}
   } finally {
-    // ====== UNLOCK ======
     creatingTicketFor.delete(userId);
   }
 }
@@ -384,4 +382,5 @@ async function handleClose(interaction) {
   }, 5000);
 }
 
+// --------------- Login ---------------
 client.login(TOKEN);
