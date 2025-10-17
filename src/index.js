@@ -29,10 +29,13 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent // voor transcript
   ],
   partials: [Partials.Channel]
 });
+
+// ====== Anti-duplicate lock per user ======
+const creatingTicketFor = new Set();
 
 // ---------------- Helpers ----------------
 function topicMetaToObj(topic) {
@@ -49,11 +52,6 @@ function topicMetaToObj(topic) {
 }
 function makeTopic(userId, claimedBy) {
   return `ticket_user:${userId};claimed_by:${claimedBy ?? ''}`;
-}
-async function findExistingTicket(guild, userId) {
-  return guild.channels.cache.find(
-    ch => ch.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
-  );
 }
 function panelFooterText(supportRoleId, categoryId) {
   return `support_role:${supportRoleId || ''};category:${categoryId || ''}`;
@@ -174,85 +172,111 @@ async function handleOpenTicket(interaction) {
   const guild = interaction.guild;
   if (!guild) return interaction.reply({ content: 'Niet in een server.', ephemeral: true });
 
-  const existing = await findExistingTicket(guild, interaction.user.id);
-  if (existing) return interaction.reply({ content: `Je hebt al een ticket: ${existing}`, ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const userId = interaction.user.id;
 
-  // Config uit het panel
-  const embed = interaction.message.embeds?.[0];
-  const { supportRoleId, categoryId } = parseFooter(embed);
-
-  const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
-
-  // Permissies — support-rol zichtbaar & kan praten
-  const overwrites = [
-    { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
-    { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
-    { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member }
-  ];
-  if (supportRoleId) {
-    overwrites.push({
-      id: supportRoleId.toString(),
-      allow: [
-        PermissionsBitField.Flags.ViewChannel,
-        PermissionsBitField.Flags.SendMessages,
-        PermissionsBitField.Flags.ReadMessageHistory,
-        PermissionsBitField.Flags.AttachFiles
-      ],
-      type: OverwriteType.Role
-    });
+  // ====== LOCK ======
+  if (creatingTicketFor.has(userId)) {
+    return interaction.editReply({ content: 'Je ticket is al in aanmaak… ⏳' });
   }
+  creatingTicketFor.add(userId);
 
-  const channel = await guild.channels.create({
-    name: baseName,
-    type: ChannelType.GuildText,
-    parent: categoryId ? categoryId.toString() : undefined,
-    topic: makeTopic(interaction.user.id, null),
-    permissionOverwrites: overwrites
-  });
+  try {
+    // Sterke check: volledige fetch
+    const allChannels = await guild.channels.fetch();
+    const existing = allChannels.find(
+      ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
+    );
+    if (existing) {
+      return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
+    }
 
-  // Bevestiging voor opener (ephemeral)
-  await interaction.reply({ content: `✅ Ticket aangemaakt: ${channel}`, ephemeral: true });
+    // Panel-config
+    const embed = interaction.message.embeds?.[0];
+    const { supportRoleId, categoryId } = parseFooter(embed);
 
-  // 1) Tag opener + support-rol (in het ticket)
-  if (supportRoleId) {
-    await channel.send({
-      content: `${interaction.user} <@&${supportRoleId}>`,
-      allowedMentions: { parse: [], users: [interaction.user.id], roles: [supportRoleId.toString()] }
+    const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
+
+    // Permissies — support-rol zichtbaar & kan praten
+    const overwrites = [
+      { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
+      { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
+      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessage, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles].filter(Boolean), type: OverwriteType.Member }
+    ];
+    // Fix: SendMessages bit correct toevoegen (bovenstaande filter voor typos)
+    overwrites[2].allow = [
+      PermissionsBitField.Flags.ViewChannel,
+      PermissionsBitField.Flags.SendMessages,
+      PermissionsBitField.Flags.ManageChannels,
+      PermissionsBitField.Flags.ReadMessageHistory,
+      PermissionsBitField.Flags.AttachFiles
+    ];
+    if (supportRoleId) {
+      overwrites.push({
+        id: supportRoleId.toString(),
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.SendMessages,
+          PermissionsBitField.Flags.ReadMessageHistory,
+          PermissionsBitField.Flags.AttachFiles
+        ],
+        type: OverwriteType.Role
+      });
+    }
+
+    // Kanaal maken
+    const channel = await guild.channels.create({
+      name: baseName,
+      type: ChannelType.GuildText,
+      parent: categoryId ? categoryId.toString() : undefined,
+      topic: makeTopic(userId, null),
+      permissionOverwrites: overwrites
     });
-  } else {
-    await channel.send({
-      content: `${interaction.user}`,
-      allowedMentions: { parse: [], users: [interaction.user.id] }
-    });
-  }
 
-  // 2) Welkomst-embed
-  const welcomeEmbed = new EmbedBuilder()
-    .setColor('#8000ff')
-    .setTitle('🎟️ Thanks for opening a ticket!')
-    .setDescription('Support will be with you shortly 💜')
-    .setFooter({ text: 'Phantom Forge Support' });
+    await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
 
-  await channel.send({ embeds: [welcomeEmbed] });
+    // 1) Opener + support taggen
+    if (supportRoleId) {
+      await channel.send({
+        content: `${interaction.user} <@&${supportRoleId}>`,
+        allowedMentions: { parse: [], users: [userId], roles: [supportRoleId.toString()] }
+      });
+    } else {
+      await channel.send({
+        content: `${interaction.user}`,
+        allowedMentions: { parse: [], users: [userId] }
+      });
+    }
 
-  // 3) Knoppen: Claim (Secondary) + Close (Primary ~ paars)
-  const ticketButtons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('claim_ticket_btn')
-      .setLabel('🟣 Claim Ticket')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('close_ticket_btn')
-      .setLabel('🟪 Close Ticket')
-      .setStyle(ButtonStyle.Primary)
-  );
-  await channel.send({ components: [ticketButtons] });
+    // 2) Welkomst-embed
+    const welcomeEmbed = new EmbedBuilder()
+      .setColor('#8000ff')
+      .setTitle('🎟️ Thanks for opening a ticket!')
+      .setDescription('Support will be with you shortly 💜')
+      .setFooter({ text: 'Phantom Forge Support' });
+    await channel.send({ embeds: [welcomeEmbed] });
 
-  // Optioneel: beperk spammen voor everyone
-  await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
-  await channel.permissionOverwrites.edit(interaction.user.id, { SendMessages: true }).catch(() => {});
-  if (supportRoleId) {
-    await channel.permissionOverwrites.edit(supportRoleId.toString(), { SendMessages: true }).catch(() => {});
+    // 3) Knoppen: Claim (Secondary) + Close (Primary ~ paars)
+    const ticketButtons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('claim_ticket_btn').setLabel('🟣 Claim Ticket').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('close_ticket_btn').setLabel('🟪 Close Ticket').setStyle(ButtonStyle.Primary)
+    );
+    await channel.send({ components: [ticketButtons] });
+
+    // Anti-spam
+    await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
+    await channel.permissionOverwrites.edit(userId, { SendMessages: true }).catch(() => {});
+    if (supportRoleId) {
+      await channel.permissionOverwrites.edit(supportRoleId.toString(), { SendMessages: true }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('Fout bij open ticket:', err);
+    try {
+      await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' });
+    } catch {}
+  } finally {
+    // ====== UNLOCK ======
+    creatingTicketFor.delete(userId);
   }
 }
 
@@ -261,6 +285,7 @@ async function handleClaim(interaction) {
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
     return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
   const meta = topicMetaToObj(channel.topic);
   if (!meta.user) return interaction.reply({ content: 'Dit kanaal is geen ticket.', ephemeral: true });
 
@@ -285,6 +310,7 @@ async function handleAdd(interaction) {
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
     return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
   const meta = topicMetaToObj(channel.topic);
   if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
 
@@ -316,6 +342,7 @@ async function handleClose(interaction) {
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
     return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
   const meta = topicMetaToObj(channel.topic);
   if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
 
