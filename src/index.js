@@ -34,11 +34,11 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ====== Anti-duplicate locks ======
-const creatingTicketFor = new Set();
-const processingInteraction = new Set();
+// ===== Locks om dubbele acties te voorkomen =====
+const creatingTicketFor = new Set();     // per user
+const processingInteraction = new Set(); // per interaction
 
-// ---------------- Helpers ----------------
+// ================= Helpers =================
 function topicMetaToObj(topic) {
   const meta = { user: null, claimed_by: null };
   if (!topic) return meta;
@@ -70,7 +70,6 @@ function parseFooter(embed) {
   } catch {}
   return out;
 }
-
 async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   const targetFooter = panelFooterText(supportRoleId, categoryId);
   const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
@@ -83,7 +82,7 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   return null;
 }
 
-// ---------------- Slash Commands ----------------
+// ================ Slash Commands ================
 const commands = [
   {
     name: 'panel',
@@ -120,13 +119,13 @@ async function registerCommands() {
   }
 }
 
-// ---------------- Ready ----------------
+// ================== Ready ==================
 client.once('ready', async () => {
   console.log(`✅ Ingelogd als ${client.user.tag}`);
   await registerCommands();
 });
 
-// ---------------- Interaction Handling ----------------
+// ============ Interaction handling ============
 client.on('interactionCreate', async (interaction) => {
   try {
     const key = `${interaction.id}`;
@@ -154,7 +153,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------------- Commands ----------------
+// ================= Commands =================
 async function handlePanel(interaction) {
   if (
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
@@ -294,6 +293,38 @@ async function handleClaim(interaction) {
   );
 }
 
+async function handleAdd(interaction) {
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  if (!guild || channel?.type !== ChannelType.GuildText)
+    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
+  const meta = topicMetaToObj(channel.topic);
+  if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
+
+  const user = interaction.options.getUser('user', true);
+
+  const isOwner = String(interaction.user.id) === meta.user;
+  const isSupport =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
+    (DEFAULT_SUPPORT_ROLE_ID && interaction.member.roles.cache.has(DEFAULT_SUPPORT_ROLE_ID.toString()));
+  const isAdmin =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+  if (!(isOwner || isSupport || isAdmin))
+    return interaction.reply({ content: 'Je mag geen personen toevoegen aan dit ticket.', ephemeral: true });
+
+  await channel.permissionOverwrites.edit(user.id, {
+    ViewChannel: true,
+    SendMessages: true,
+    ReadMessageHistory: true,
+    AttachFiles: true
+  });
+
+  await interaction.reply({ content: `${user} toegevoegd aan ticket ✅` });
+}
+
 async function handleClose(interaction) {
   const channel = interaction.channel;
   const guild = interaction.guild;
@@ -305,10 +336,10 @@ async function handleClose(interaction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Transcript (zoals eerst — gewoon bestand posten)
+  // ===== Transcript opbouwen (laatste 100 berichten) =====
   const messages = await channel.messages.fetch({ limit: 100 });
   const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  let txt = '';
+  let txt = `Transcript van #${channel.name}\n\n`;
   for (const m of sorted) {
     const atts = m.attachments?.size
       ? ' ' + [...m.attachments.values()].map(a => `[attachment:${a.name}]`).join(' ')
@@ -317,12 +348,31 @@ async function handleClose(interaction) {
   }
   const buffer = Buffer.from(txt, 'utf-8');
 
-  await channel.send({ files: [{ attachment: buffer, name: `${channel.name}-transcript.txt` }] });
-  await interaction.editReply({ content: 'Transcript verzonden ✅ Kanaal wordt gesloten...' });
+  // ===== DM naar ticket-opener =====
+  let dmOk = false;
+  try {
+    const user = await client.users.fetch(meta.user);
+    await user.send({
+      content: `🗂️ Hier is de transcript van je ticket **#${channel.name}**.`,
+      files: [{ attachment: buffer, name: `${channel.name}-transcript.txt` }]
+    });
+    dmOk = true;
+  } catch (e) {
+    dmOk = false; // DM gesloten / mislukt
+  }
+
+  // Antwoord aan de sluiter (ephemeral) en daarna kanaal sluiten
+  if (dmOk) {
+    await interaction.editReply({ content: 'Transcript is per DM verstuurd ✅ Kanaal wordt gesloten…' });
+  } else {
+    await interaction.editReply({
+      content: 'Kon geen DM sturen (gebruiker blokkeert DM’s). Kanaal wordt toch gesloten.'
+    });
+  }
 
   setTimeout(async () => {
     try { await channel.delete('Ticket gesloten.'); } catch {}
-  }, 5000);
+  }, 4000);
 }
 
 client.login(TOKEN);
