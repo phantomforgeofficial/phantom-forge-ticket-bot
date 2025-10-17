@@ -29,7 +29,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // voor volledige transcripts / content
+    GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Channel]
 });
@@ -120,7 +120,7 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
-      if (commandName === 'pannel') return handlePannel(interaction);
+      if (commandName === 'panel') return handlePanel(interaction);
       if (commandName === 'claim') return handleClaim(interaction);
       if (commandName === 'add') return handleAdd(interaction);
       if (commandName === 'close') return handleClose(interaction);
@@ -138,7 +138,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ---------------- Commands ----------------
-async function handlePannel(interaction) {
+async function handlePanel(interaction) {
   if (
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)
@@ -156,14 +156,14 @@ async function handlePannel(interaction) {
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(description)
-    .setColor('#8000ff') // 💜 paneelkleur
+    .setColor('#8000ff')
     .setFooter({ text: panelFooterText(supportRoleId, categoryId) });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('open_ticket_btn')
       .setLabel('🎟️ Open Ticket')
-      .setStyle(ButtonStyle.Secondary) // dichtstbij #8000ff
+      .setStyle(ButtonStyle.Secondary)
   );
 
   await interaction.channel.send({ embeds: [embed], components: [row] });
@@ -177,13 +177,13 @@ async function handleOpenTicket(interaction) {
   const existing = await findExistingTicket(guild, interaction.user.id);
   if (existing) return interaction.reply({ content: `Je hebt al een ticket: ${existing}`, ephemeral: true });
 
-  // Haal panel-config uit embed footer
+  // Config uit het panel
   const embed = interaction.message.embeds?.[0];
   const { supportRoleId, categoryId } = parseFooter(embed);
 
   const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
 
-  // Permissies
+  // Permissies — support-rol zichtbaar & kan praten
   const overwrites = [
     { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
     { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
@@ -210,10 +210,23 @@ async function handleOpenTicket(interaction) {
     permissionOverwrites: overwrites
   });
 
-  // Ephemeral bevestiging voor de opener
+  // Bevestiging voor opener (ephemeral)
   await interaction.reply({ content: `✅ Ticket aangemaakt: ${channel}`, ephemeral: true });
 
-  // Welkomst-embed
+  // 1) Tag opener + support-rol (in het ticket)
+  if (supportRoleId) {
+    await channel.send({
+      content: `${interaction.user} <@&${supportRoleId}>`,
+      allowedMentions: { parse: [], users: [interaction.user.id], roles: [supportRoleId.toString()] }
+    });
+  } else {
+    await channel.send({
+      content: `${interaction.user}`,
+      allowedMentions: { parse: [], users: [interaction.user.id] }
+    });
+  }
+
+  // 2) Welkomst-embed
   const welcomeEmbed = new EmbedBuilder()
     .setColor('#8000ff')
     .setTitle('🎟️ Thanks for opening a ticket!')
@@ -222,7 +235,7 @@ async function handleOpenTicket(interaction) {
 
   await channel.send({ embeds: [welcomeEmbed] });
 
-  // Knoppen onder het embed: Claim & Close
+  // 3) Knoppen: Claim (Secondary) + Close (Primary ~ paars)
   const ticketButtons = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('claim_ticket_btn')
@@ -230,14 +243,17 @@ async function handleOpenTicket(interaction) {
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('close_ticket_btn')
-      .setLabel('🔴 Close Ticket')
-      .setStyle(ButtonStyle.Danger)
+      .setLabel('🟪 Close Ticket')
+      .setStyle(ButtonStyle.Primary)
   );
   await channel.send({ components: [ticketButtons] });
 
-  // (Optioneel) beperk spammen/commands door everyone te muten, opener mag wel praten
+  // Optioneel: beperk spammen voor everyone
   await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
   await channel.permissionOverwrites.edit(interaction.user.id, { SendMessages: true }).catch(() => {});
+  if (supportRoleId) {
+    await channel.permissionOverwrites.edit(supportRoleId.toString(), { SendMessages: true }).catch(() => {});
+  }
 }
 
 async function handleClaim(interaction) {
@@ -274,7 +290,6 @@ async function handleAdd(interaction) {
 
   const user = interaction.options.getUser('user', true);
 
-  // Owner/support/admin check
   const isOwner = String(interaction.user.id) === meta.user;
   const isSupport =
     interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
@@ -304,7 +319,6 @@ async function handleClose(interaction) {
   const meta = topicMetaToObj(channel.topic);
   if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
 
-  // Owner/support/admin check
   const isOwner = String(interaction.user.id) === meta.user;
   const isSupport =
     interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
