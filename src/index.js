@@ -35,8 +35,8 @@ const client = new Client({
 });
 
 // ====== Anti-duplicate locks ======
-const creatingTicketFor = new Set();          // per gebruiker
-const processingInteraction = new Set();      // per interaction id
+const creatingTicketFor = new Set();     // per user lock
+const processingInteraction = new Set(); // per interaction lock
 
 // ---------------- Helpers ----------------
 function topicMetaToObj(topic) {
@@ -69,6 +69,19 @@ function parseFooter(embed) {
     }
   } catch {}
   return out;
+}
+
+// Zoek of er al een paneel in dit kanaal staat met dezelfde config (footer)
+async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
+  const targetFooter = panelFooterText(supportRoleId, categoryId);
+  const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!msgs) return null;
+  for (const m of msgs.values()) {
+    if (m.author?.id !== channel.client.user.id) continue;
+    const emb = m.embeds?.[0];
+    if (emb?.footer?.text === targetFooter) return m;
+  }
+  return null;
 }
 
 // ---------------- Slash Commands ----------------
@@ -117,7 +130,6 @@ client.once('ready', async () => {
 // ---------------- Interaction Handling ----------------
 client.on('interactionCreate', async (interaction) => {
   try {
-    // bescherm tegen dubbele verwerking van dezelfde interaction
     const key = `${interaction.id}`;
     if (processingInteraction.has(key)) return;
     processingInteraction.add(key);
@@ -148,8 +160,11 @@ async function handlePanel(interaction) {
   if (
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)
-  )
+  ) {
     return interaction.reply({ content: 'Je hebt beheerderrechten nodig.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
 
   const supportRole = interaction.options.getRole('support_role');
   const category = interaction.options.getChannel('category');
@@ -169,9 +184,15 @@ async function handlePanel(interaction) {
     new ButtonBuilder().setCustomId('open_ticket_btn').setLabel('🎟️ Open Ticket').setStyle(ButtonStyle.Secondary)
   );
 
-  // enkelvoudige send + sprake van geen extra sends
-  await interaction.channel.send({ embeds: [embed], components: [row] });
-  await interaction.reply({ content: 'Ticketpaneel geplaatst ✅', ephemeral: true });
+  // voorkom dubbele panelen — update bestaand paneel i.p.v. nieuw te posten
+  const existingPanel = await findExistingPanelMessage(interaction.channel, supportRoleId, categoryId);
+  if (existingPanel) {
+    await existingPanel.edit({ embeds: [embed], components: [row] }).catch(() => {});
+    await interaction.editReply('Bestaand ticketpaneel geüpdatet ✅');
+  } else {
+    await interaction.channel.send({ embeds: [embed], components: [row] });
+    await interaction.editReply('Ticketpaneel geplaatst ✅');
+  }
 }
 
 async function handleOpenTicket(interaction) {
@@ -188,22 +209,20 @@ async function handleOpenTicket(interaction) {
   creatingTicketFor.add(userId);
 
   try {
-    // Sterke check: fetch ALLE kanalen (niet alleen cache)
+    // check bestaande tickets (volle fetch)
     const allChannels = await guild.channels.fetch();
     const existing = allChannels.find(
       ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
     );
-    if (existing) {
-      return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
-    }
+    if (existing) return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
 
-    // Config uit het panel
-    const embedFromPanel = interaction.message.embeds?.[0];
-    const { supportRoleId, categoryId } = parseFooter(embedFromPanel);
+    // config uit panel-footer
+    const emb = interaction.message.embeds?.[0];
+    const { supportRoleId, categoryId } = parseFooter(emb);
 
     const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
 
-    // Permissies (bot + opener + support rol)
+    // basis-permissies
     const overwrites = [
       { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
       { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
@@ -222,7 +241,7 @@ async function handleOpenTicket(interaction) {
       });
     }
 
-    // Kanaal maken
+    // maak kanaal
     const channel = await guild.channels.create({
       name: baseName,
       type: ChannelType.GuildText,
@@ -233,22 +252,19 @@ async function handleOpenTicket(interaction) {
 
     await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
 
-    // Welkomst-embed
+    // welkom-embed + knoppen (alles in één send samen met mentions)
     const welcomeEmbed = new EmbedBuilder()
       .setColor('#8000ff')
       .setTitle('🎟️ Thanks for opening a ticket!')
       .setDescription('Support will be with you shortly 💜')
       .setFooter({ text: 'Phantom Forge Support' });
 
-    // Knoppen
     const ticketButtons = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('claim_ticket_btn').setLabel('🟣 Claim Ticket').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('close_ticket_btn').setLabel('🟪 Close Ticket').setStyle(ButtonStyle.Primary)
     );
 
-    // 🔥 Alles in ÉÉN send (mention + embed + knoppen)
-    const contentParts = [];
-    contentParts.push(`${interaction.user}`);
+    const contentParts = [`${interaction.user}`];
     if (supportRoleId) contentParts.push(`<@&${supportRoleId}>`);
 
     await channel.send({
@@ -262,7 +278,7 @@ async function handleOpenTicket(interaction) {
       components: [ticketButtons]
     });
 
-    // Anti-spam: iedereen dicht, opener + support open
+    // anti-spam: alleen opener + support mogen praten
     await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
     await channel.permissionOverwrites.edit(userId, { SendMessages: true }).catch(() => {});
     if (supportRoleId) {
@@ -270,9 +286,7 @@ async function handleOpenTicket(interaction) {
     }
   } catch (err) {
     console.error('Fout bij open ticket:', err);
-    try {
-      await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' });
-    } catch {}
+    try { await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' }); } catch {}
   } finally {
     creatingTicketFor.delete(userId);
   }
@@ -376,9 +390,7 @@ async function handleClose(interaction) {
   await interaction.editReply({ content: 'Transcript gepost. Kanaal wordt verwijderd…' });
 
   setTimeout(async () => {
-    try {
-      await channel.delete('Ticket gesloten en verwijderd.');
-    } catch (e) {}
+    try { await channel.delete('Ticket gesloten en verwijderd.'); } catch (e) {}
   }, 5000);
 }
 
