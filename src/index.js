@@ -14,16 +14,19 @@ import {
   Routes
 } from 'discord.js';
 
+// ========== ENV ==========
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // voor transcript (gist scope)
 
 if (!TOKEN) {
   console.error('❌ Zet DISCORD_TOKEN in je .env!');
   process.exit(1);
 }
 
+// ========== CLIENT ==========
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -34,11 +37,11 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ====== Anti-duplicate locks ======
-const creatingTicketFor = new Set();     // per user lock
-const processingInteraction = new Set(); // per interaction lock
+// ========== LOCKS ==========
+const creatingTicketFor = new Set();     // per user
+const processingInteraction = new Set(); // per interaction
 
-// ---------------- Helpers ----------------
+// ========== HELPERS ==========
 function topicMetaToObj(topic) {
   const meta = { user: null, claimed_by: null };
   if (!topic) return meta;
@@ -84,7 +87,31 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   return null;
 }
 
-// ---------------- Slash Commands ----------------
+// Upload transcript als HTML naar GitHub Gist en retourneer de URL
+async function uploadTranscriptToGist(filename, html, isPublic = false) {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN ontbreekt (met gist scope)');
+  const body = {
+    description: `Phantom Forge Ticket Transcript - ${filename}`,
+    public: isPublic,
+    files: { [filename]: { content: html } }
+  };
+  const res = await fetch('https://api.github.com/gists', {
+    method: 'POST',
+    headers: {
+      'Authorization': `token ${GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Gist upload failed: ${res.status} ${txt}`);
+  }
+  const data = await res.json();
+  return data.html_url;
+}
+
+// ========== SLASH COMMANDS ==========
 const commands = [
   {
     name: 'panel',
@@ -121,13 +148,13 @@ async function registerCommands() {
   }
 }
 
-// ---------------- Ready ----------------
+// ========== READY ==========
 client.once('ready', async () => {
   console.log(`✅ Ingelogd als ${client.user.tag}`);
   await registerCommands();
 });
 
-// ---------------- Interaction Handling ----------------
+// ========== INTERACTIONS ==========
 client.on('interactionCreate', async (interaction) => {
   try {
     const key = `${interaction.id}`;
@@ -155,7 +182,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ---------------- Commands ----------------
+// ========== HANDLERS ==========
 async function handlePanel(interaction) {
   if (
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
@@ -184,7 +211,6 @@ async function handlePanel(interaction) {
     new ButtonBuilder().setCustomId('open_ticket_btn').setLabel('🎟️ Open Ticket').setStyle(ButtonStyle.Secondary)
   );
 
-  // voorkom dubbele panelen — update bestaand paneel i.p.v. nieuw te posten
   const existingPanel = await findExistingPanelMessage(interaction.channel, supportRoleId, categoryId);
   if (existingPanel) {
     await existingPanel.edit({ embeds: [embed], components: [row] }).catch(() => {});
@@ -202,27 +228,23 @@ async function handleOpenTicket(interaction) {
   await interaction.deferReply({ ephemeral: true });
   const userId = interaction.user.id;
 
-  // per-user lock
   if (creatingTicketFor.has(userId)) {
     return interaction.editReply({ content: 'Je ticket is al in aanmaak… ⏳' });
   }
   creatingTicketFor.add(userId);
 
   try {
-    // check bestaande tickets (volle fetch)
     const allChannels = await guild.channels.fetch();
     const existing = allChannels.find(
       ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
     );
     if (existing) return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
 
-    // config uit panel-footer
     const emb = interaction.message.embeds?.[0];
     const { supportRoleId, categoryId } = parseFooter(emb);
 
     const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
 
-    // basis-permissies
     const overwrites = [
       { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
       { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
@@ -241,7 +263,6 @@ async function handleOpenTicket(interaction) {
       });
     }
 
-    // maak kanaal
     const channel = await guild.channels.create({
       name: baseName,
       type: ChannelType.GuildText,
@@ -252,7 +273,6 @@ async function handleOpenTicket(interaction) {
 
     await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
 
-    // welkom-embed + knoppen (alles in één send samen met mentions)
     const welcomeEmbed = new EmbedBuilder()
       .setColor('#8000ff')
       .setTitle('🎟️ Thanks for opening a ticket!')
@@ -278,7 +298,7 @@ async function handleOpenTicket(interaction) {
       components: [ticketButtons]
     });
 
-    // anti-spam: alleen opener + support mogen praten
+    // anti-spam
     await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
     await channel.permissionOverwrites.edit(userId, { SendMessages: true }).catch(() => {});
     if (supportRoleId) {
@@ -371,28 +391,84 @@ async function handleClose(interaction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Transcript (laatste 100 berichten)
+  // Berichten ophalen
   const messages = await channel.messages.fetch({ limit: 100 });
   const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  let txt = `Transcript van #${channel.name}\nGesloten door: ${interaction.user.tag} (${interaction.user.id})\n\n`;
-  for (const m of sorted) {
-    const atts = m.attachments?.size
-      ? ' ' + [...m.attachments.values()].map(a => `[attachment:${a.name}]`).join(' ')
-      : '';
-    txt += `[${new Date(m.createdTimestamp).toISOString()}] ${m.author.tag} (${m.author.id}): ${m.content || ''}${atts}\n`;
-  }
-  const buffer = Buffer.from(txt, 'utf-8');
 
-  await channel.send({
-    content: 'Ticket wordt gesloten. Transcript hieronder en kanaal wordt zo verwijderd.',
-    files: [{ attachment: buffer, name: `${channel.name}-transcript.txt` }]
-  });
-  await interaction.editReply({ content: 'Transcript gepost. Kanaal wordt verwijderd…' });
+  // HTML transcript
+  const rows = sorted.map(m => {
+    const time = new Date(m.createdTimestamp).toLocaleString();
+    const name = m.author?.tag ?? m.author?.id ?? 'Unknown';
+    const content = (m.content || '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\n/g,'<br>');
+    const atts = m.attachments?.size
+      ? [...m.attachments.values()].map(a => `<a href="${a.url}" target="_blank" rel="noopener">📎 ${a.name}</a>`).join(' ')
+      : '';
+    return `<div class="msg"><div class="meta">[${time}] <b>${name}</b></div><div class="text">${content} ${atts}</div></div>`;
+  }).join('\n');
+
+  const html = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Transcript #${channel.name}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{background:#0f0f14;color:#eaeaf0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;margin:0;padding:24px;}
+  .wrap{max-width:900px;margin:0 auto;}
+  h1{margin:0 0 6px;font-size:22px}
+  .sub{opacity:.8;margin:0 0 18px;font-size:13px}
+  .msg{background:#181826;border:1px solid #2a2a40;border-radius:12px;padding:12px 14px;margin:10px 0}
+  .meta{color:#9aa0a6;font-size:12px;margin-bottom:6px}
+  .text{font-size:14px;line-height:1.4;word-break:break-word}
+  a{color:#8a5fff}
+</style></head>
+<body><div class="wrap">
+  <h1>Transcript #${channel.name}</h1>
+  <div class="sub">Closed by: ${interaction.user.tag} (${interaction.user.id}) · Guild: ${guild.name}</div>
+  ${rows || '<i>No content</i>'}
+</div></body></html>`;
+
+  // Upload naar Gist (secret)
+  const filename = `${channel.name}-${Date.now()}.html`;
+  let url;
+  try {
+    url = await uploadTranscriptToGist(filename, html, false);
+  } catch (e) {
+    console.error(e);
+    return interaction.editReply({ content: '❌ Upload naar website (Gist) mislukte.' });
+  }
+
+  // DM embed + knop (geen link in het ticket)
+  const user = await client.users.fetch(meta.user).catch(() => null);
+  const transcriptEmbed = new EmbedBuilder()
+    .setColor('#8000ff')
+    .setTitle(`🎫 Ticket Closed on ${guild.name}`)
+    .setDescription(`Your ticket on the server **${guild.name}** has been closed.\nYou can view the transcript here:`)
+    .setFooter({ text: 'Phantom Forge Support' });
+
+  const button = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('📜 View Transcript').setStyle(ButtonStyle.Link).setURL(url)
+  );
+
+  let dmOk = false;
+  if (user) {
+    dmOk = await user.send({ embeds: [transcriptEmbed], components: [button] })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  if (dmOk) {
+    await channel.send({ content: '✅ Ticket wordt gesloten. Transcript is per DM naar de opener gestuurd.' }).catch(() => {});
+  } else {
+    await channel.send({ content: 'ℹ️ Ticket wordt gesloten. Kon geen DM sturen naar de opener (DMs uit?).' }).catch(() => {});
+  }
+
+  await interaction.editReply({ content: '✅ Afgerond. Kanaal wordt verwijderd…' });
 
   setTimeout(async () => {
-    try { await channel.delete('Ticket gesloten en verwijderd.'); } catch (e) {}
+    try { await channel.delete('Ticket gesloten en transcript via DM verstuurd.'); } catch {}
   }, 5000);
 }
 
-// --------------- Login ---------------
+// ========== LOGIN ==========
 client.login(TOKEN);
