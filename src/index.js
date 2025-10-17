@@ -75,7 +75,7 @@ function parseFooter(embed) {
 // ---------------- Slash Commands ----------------
 const commands = [
   {
-    name: 'pannel',
+    name: 'panel',
     description: 'Stuur een ticketpaneel in dit kanaal',
     options: [
       { name: 'support_role', description: 'Support-rol die tickets mag zien', type: 8, required: false },
