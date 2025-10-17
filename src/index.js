@@ -1,340 +1,474 @@
-// =========================
-// Phantom Forge Ticket Bot (CommonJS)
-// =========================
-const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  PermissionsBitField,
-  EmbedBuilder,
+import 'dotenv/config';
+import {
+  ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ActionRowBuilder,
   ChannelType,
-  SlashCommandBuilder,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  OverwriteType,
+  Partials,
+  PermissionsBitField,
   REST,
-  Routes,
-} = require("discord.js");
-const { Octokit } = require("@octokit/rest");
-const dotenv = require("dotenv");
-dotenv.config();
+  Routes
+} from 'discord.js';
 
+// ========== ENV ==========
+const TOKEN = process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.GUILD_ID;
+const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
+const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // voor transcript (gist scope)
+
+if (!TOKEN) {
+  console.error('❌ Zet DISCORD_TOKEN in je .env!');
+  process.exit(1);
+}
+
+// ========== CLIENT ==========
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Channel, Partials.Message],
+  partials: [Partials.Channel]
 });
 
-// ---- ENV
-const TOKEN = process.env.TOKEN;
-const GUILD_ID = process.env.GUILD_ID;
-const SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID;
-const CATEGORY_ID = process.env.CATEGORY_ID?.trim() || ""; // mag leeg
-const GITHUB_USER = process.env.GITHUB_USER;
-const GITHUB_REPO = process.env.GITHUB_REPO;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+// ========== LOCKS ==========
+const creatingTicketFor = new Set();     // per user
+const processingInteraction = new Set(); // per interaction
 
-// =========================
-// Helpers
-// =========================
-
-// Haal categorie op en valideer type
-async function resolveCategory(guild) {
-  if (!CATEGORY_ID) return { category: null, reason: "Geen CATEGORY_ID gezet." };
+// ========== HELPERS ==========
+function topicMetaToObj(topic) {
+  const meta = { user: null, claimed_by: null };
+  if (!topic) return meta;
   try {
-    // Probeer uit cache
-    let cat = guild.channels.cache.get(CATEGORY_ID);
-    if (!cat) {
-      // fetch uit API
-      cat = await guild.channels.fetch(CATEGORY_ID).catch(() => null);
+    for (const kv of topic.split(';')) {
+      const [k, v] = kv.split(':');
+      if (k === 'ticket_user') meta.user = v && v !== 'None' ? v : null;
+      if (k === 'claimed_by') meta.claimed_by = v && v !== 'None' ? v : null;
     }
-    if (!cat) {
-      return { category: null, reason: `Categorie met ID ${CATEGORY_ID} niet gevonden.` };
+  } catch {}
+  return meta;
+}
+function makeTopic(userId, claimedBy) {
+  return `ticket_user:${userId};claimed_by:${claimedBy ?? ''}`;
+}
+function panelFooterText(supportRoleId, categoryId) {
+  return `support_role:${supportRoleId || ''};category:${categoryId || ''}`;
+}
+function parseFooter(embed) {
+  const out = { supportRoleId: null, categoryId: null };
+  const text = embed?.footer?.text ?? '';
+  if (!text) return out;
+  try {
+    for (const kv of text.split(';')) {
+      const [k, v] = kv.split(':');
+      if (k === 'support_role' && v) out.supportRoleId = BigInt(v);
+      if (k === 'category' && v) out.categoryId = BigInt(v);
     }
-    if (cat.type !== ChannelType.GuildCategory) {
-      return { category: null, reason: `Kanaal ${CATEGORY_ID} is geen categorie (type=${cat.type}).` };
-    }
-    return { category: cat, reason: "OK" };
-  } catch (e) {
-    return { category: null, reason: `Fout bij ophalen categorie: ${e.message}` };
+  } catch {}
+  return out;
+}
+
+// Zoek of er al een paneel in dit kanaal staat met dezelfde config (footer)
+async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
+  const targetFooter = panelFooterText(supportRoleId, categoryId);
+  const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!msgs) return null;
+  for (const m of msgs.values()) {
+    if (m.author?.id !== channel.client.user.id) continue;
+    const emb = m.embeds?.[0];
+    if (emb?.footer?.text === targetFooter) return m;
   }
+  return null;
 }
 
-// Upload transcript naar GitHub Pages (branch gh-pages)
-async function uploadTranscript({ guild, channel, openerUser, closerUser, messages }) {
-  const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-  const rows = messages.map(m => {
-    const name = m.author?.tag || m.author?.id || "Onbekend";
-    const time = new Date(m.createdTimestamp).toLocaleString();
-    const text = (m.content || "")
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const atts = m.attachments?.size
-      ? [...m.attachments.values()].map(a => `<a href="${a.url}" target="_blank" rel="noopener">📎 ${a.name}</a>`).join(" ")
-      : "";
-    return `<div class="msg"><div class="h"><b class="author">${name}</b><span class="time">${time}</span></div><div class="content">${text} ${atts}</div></div>`;
-  }).join("\n");
-
-  const html = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8" />
-<title>${channel.name} — Ticket Transcript</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<style>
-  body{margin:0;min-height:100vh;color:#fff;font:15px/1.5 Inter,system-ui,sans-serif;
-    background:url('https://i.postimg.cc/zvsvYJGs/Schermafbeelding-2025-10-05-022559.png') center/cover no-repeat fixed}
-  .wrap{max-width:900px;margin:40px auto;background:rgba(0,0,0,.65);border-radius:16px;padding:20px 28px;
-    box-shadow:0 0 40px rgba(128,0,255,.25)}
-  h1{margin:0 0 6px;font-size:26px;color:#a877ff;text-shadow:0 0 10px rgba(128,0,255,.5)}
-  .meta{color:#a77fff;font-size:14px;margin-bottom:12px}
-  .msg{background:rgba(19,0,37,.85);border:1px solid #2a0b4d;border-radius:12px;padding:10px 14px;margin:8px 0}
-  .msg:hover{border-color:#8000ff;box-shadow:0 0 10px rgba(128,0,255,.25)}
-  .h{display:flex;gap:8px;align-items:baseline}
-  .author{color:#a877ff}
-  .time{color:#aaa;font-size:12px}
-  .content{margin-top:4px;white-space:pre-wrap;line-height:1.5}
-  footer{text-align:center;margin-top:24px;opacity:.75;color:#a77fff}
-  a{color:#a877ff}
-</style></head>
-<body><div class="wrap">
-  <h1>Ticket Transcript</h1>
-  <div class="meta">
-    Server: <b>${guild.name}</b> • Channel: <b>#${channel.name}</b><br/>
-    Opened by: ${openerUser?.tag || openerUser?.id} • Closed by: ${closerUser?.tag || closerUser?.id}<br/>
-    Closed at: ${new Date().toLocaleString()}
-  </div>
-  ${rows || "<i>No content</i>"}
-  <footer>Made with 💜 by Phantom Forge</footer>
-</div></body></html>`;
-
-  const filename = `transcripts/${channel.name}-${Date.now()}.html`;
-
-  // Upload HTML
-  await octokit.repos.createOrUpdateFileContents({
-    owner: GITHUB_USER,
-    repo: GITHUB_REPO,
-    path: filename,
-    message: `Add transcript ${channel.name}`,
-    content: Buffer.from(html, "utf-8").toString("base64"),
-    branch: "gh-pages",
+// Upload transcript als HTML naar GitHub Gist en retourneer de URL
+async function uploadTranscriptToGist(filename, html, isPublic = false) {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN ontbreekt (met gist scope)');
+  const body = {
+    description: `Phantom Forge Ticket Transcript - ${filename}`,
+    public: isPublic,
+    files: { [filename]: { content: html } }
+  };
+  const res = await fetch('https://api.github.com/gists', {
+    method: 'POST',
+    headers: {
+      'Authorization': `token ${GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json'
+    },
+    body: JSON.stringify(body)
   });
-
-  // Update index.json (lijst op de site)
-  const indexPath = "data/index.json";
-  // Eerst proberen bestaande index op te halen
-  let sha = null;
-  let list = [];
-  try {
-    const existing = await octokit.repos.getContent({
-      owner: GITHUB_USER, repo: GITHUB_REPO, path: indexPath, ref: "gh-pages",
-    });
-    if (existing && "content" in existing.data) {
-      const buf = Buffer.from(existing.data.content, "base64").toString("utf-8");
-      sha = existing.data.sha;
-      list = JSON.parse(buf);
-      if (!Array.isArray(list)) list = [];
-    }
-  } catch { /* geen index nog */ }
-
-  list.push({
-    file: filename.split("/").pop(),
-    url: filename,
-    channel: `#${channel.name}`,
-    guild: guild.name,
-    userId: openerUser?.id,
-    userTag: openerUser?.tag || openerUser?.id,
-    closedBy: closerUser?.tag || closerUser?.id,
-    closedAt: Date.now(),
-  });
-
-  await octokit.repos.createOrUpdateFileContents({
-    owner: GITHUB_USER,
-    repo: GITHUB_REPO,
-    path: indexPath,
-    message: `Update index with ${filename}`,
-    content: Buffer.from(JSON.stringify(list, null, 2), "utf-8").toString("base64"),
-    branch: "gh-pages",
-    sha: sha || undefined,
-  });
-
-  return `https://${GITHUB_USER}.github.io/${GITHUB_REPO}/${filename}`;
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Gist upload failed: ${res.status} ${txt}`);
+  }
+  const data = await res.json();
+  return data.html_url;
 }
 
-// =========================
-// Slash command: /panel
-// =========================
+// ========== SLASH COMMANDS ==========
 const commands = [
-  new SlashCommandBuilder()
-    .setName("panel")
-    .setDescription("Verzend het ticket panel in dit kanaal."),
+  {
+    name: 'panel',
+    description: 'Stuur een ticketpaneel in dit kanaal',
+    options: [
+      { name: 'support_role', description: 'Support-rol die tickets mag zien', type: 8, required: false },
+      { name: 'category', description: 'Categorie voor ticketkanalen', type: 7, channel_types: [4], required: false },
+      { name: 'title', description: 'Titel van het paneel', type: 3, required: false },
+      { name: 'description', description: 'Beschrijving onder het paneel', type: 3, required: false }
+    ]
+  },
+  { name: 'claim', description: 'Claim dit ticket (alleen support)' },
+  {
+    name: 'add',
+    description: 'Voeg een gebruiker toe aan dit ticket',
+    options: [{ name: 'user', description: 'Gebruiker om toe te voegen', type: 6, required: true }]
+  },
+  { name: 'close', description: 'Sluit dit ticket' }
 ];
 
-// Registreer commands NA login (zodat client.user.id bestaat)
-client.once("ready", async () => {
-  console.log(`✅ Ingelogd als ${client.user.tag}`);
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
-    const rest = new REST({ version: "10" }).setToken(TOKEN);
-    await rest.put(
-      Routes.applicationGuildCommands(client.user.id, GUILD_ID),
-      { body: commands.map(c => c.toJSON()) }
-    );
-    console.log("🎯 Slash commands geregistreerd.");
+    const app = await client.application?.fetch();
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
+      console.log('✅ Guild commands gesynchroniseerd');
+    } else {
+      await rest.put(Routes.applicationCommands(app.id), { body: commands });
+      console.log('✅ Globale commands gesynchroniseerd');
+    }
   } catch (e) {
-    console.error("❌ Commands registreren faalde:", e);
+    console.error('Fout bij command sync:', e);
+  }
+}
+
+// ========== READY ==========
+client.once('ready', async () => {
+  console.log(`✅ Ingelogd als ${client.user.tag}`);
+  await registerCommands();
+});
+
+// ========== INTERACTIONS ==========
+client.on('interactionCreate', async (interaction) => {
+  try {
+    const key = `${interaction.id}`;
+    if (processingInteraction.has(key)) return;
+    processingInteraction.add(key);
+
+    if (interaction.isChatInputCommand()) {
+      const { commandName } = interaction;
+      if (commandName === 'panel') await handlePanel(interaction);
+      if (commandName === 'claim') await handleClaim(interaction);
+      if (commandName === 'add') await handleAdd(interaction);
+      if (commandName === 'close') await handleClose(interaction);
+    } else if (interaction.isButton()) {
+      if (interaction.customId === 'open_ticket_btn') await handleOpenTicket(interaction);
+      if (interaction.customId === 'claim_ticket_btn') await handleClaim(interaction);
+      if (interaction.customId === 'close_ticket_btn') await handleClose(interaction);
+    }
+  } catch (e) {
+    console.error(e);
+    const msg = { content: 'Er ging iets mis.', ephemeral: true };
+    if (interaction.deferred || interaction.replied) await interaction.followUp(msg).catch(() => {});
+    else await interaction.reply(msg).catch(() => {});
+  } finally {
+    processingInteraction.delete(`${interaction.id}`);
   }
 });
 
-// =========================
-// Interactions
-// =========================
-client.on("interactionCreate", async (interaction) => {
+// ========== HANDLERS ==========
+async function handlePanel(interaction) {
+  if (
+    !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
+    !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)
+  ) {
+    return interaction.reply({ content: 'Je hebt beheerderrechten nodig.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const supportRole = interaction.options.getRole('support_role');
+  const category = interaction.options.getChannel('category');
+  const title = interaction.options.getString('title') ?? 'Phantom Forge Support';
+  const description = interaction.options.getString('description') ?? 'Klik op de knop om een privé-ticket te openen.';
+
+  const supportRoleId = supportRole?.id ? BigInt(supportRole.id) : DEFAULT_SUPPORT_ROLE_ID;
+  const categoryId = category?.id ? BigInt(category.id) : DEFAULT_CATEGORY_ID;
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor('#8000ff')
+    .setFooter({ text: panelFooterText(supportRoleId, categoryId) });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('open_ticket_btn').setLabel('🎟️ Open Ticket').setStyle(ButtonStyle.Secondary)
+  );
+
+  const existingPanel = await findExistingPanelMessage(interaction.channel, supportRoleId, categoryId);
+  if (existingPanel) {
+    await existingPanel.edit({ embeds: [embed], components: [row] }).catch(() => {});
+    await interaction.editReply('Bestaand ticketpaneel geüpdatet ✅');
+  } else {
+    await interaction.channel.send({ embeds: [embed], components: [row] });
+    await interaction.editReply('Ticketpaneel geplaatst ✅');
+  }
+}
+
+async function handleOpenTicket(interaction) {
+  const guild = interaction.guild;
+  if (!guild) return interaction.reply({ content: 'Niet in een server.', ephemeral: true });
+
+  await interaction.deferReply({ ephemeral: true });
+  const userId = interaction.user.id;
+
+  if (creatingTicketFor.has(userId)) {
+    return interaction.editReply({ content: 'Je ticket is al in aanmaak… ⏳' });
+  }
+  creatingTicketFor.add(userId);
+
   try {
-    // /panel
-    if (interaction.isChatInputCommand() && interaction.commandName === "panel") {
-      const embed = new EmbedBuilder()
-        .setColor("#8000FF")
-        .setTitle("🎟️ Open een Ticket")
-        .setDescription("Klik hieronder om een ticket te openen. Ons supportteam helpt je zo snel mogelijk 💜");
+    const allChannels = await guild.channels.fetch();
+    const existing = allChannels.find(
+      ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
+    );
+    if (existing) return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
 
-      // LET OP: paars/blurple = Primary (Discord beperkt kleuren van knoppen)
-      const openBtn = new ButtonBuilder()
-        .setCustomId("open_ticket")
-        .setLabel("💜 Open Ticket")
-        .setStyle(ButtonStyle.Primary);
+    const emb = interaction.message.embeds?.[0];
+    const { supportRoleId, categoryId } = parseFooter(emb);
 
-      await interaction.reply({
-        embeds: [embed],
-        components: [new ActionRowBuilder().addComponents(openBtn)],
+    const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
+
+    const overwrites = [
+      { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
+      { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
+      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member }
+    ];
+    if (supportRoleId) {
+      overwrites.push({
+        id: supportRoleId.toString(),
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.SendMessages,
+          PermissionsBitField.Flags.ReadMessageHistory,
+          PermissionsBitField.Flags.AttachFiles
+        ],
+        type: OverwriteType.Role
       });
-      return;
     }
 
-    // Buttons
-    if (!interaction.isButton()) return;
+    const channel = await guild.channels.create({
+      name: baseName,
+      type: ChannelType.GuildText,
+      parent: categoryId ? categoryId.toString() : undefined,
+      topic: makeTopic(userId, null),
+      permissionOverwrites: overwrites
+    });
 
-    // Open ticket
-    if (interaction.customId === "open_ticket") {
-      // Uniek kanaal per gebruiker
-      const already = interaction.guild.channels.cache.find(
-        ch => ch.type === ChannelType.GuildText && ch.name === `ticket-${interaction.user.id}`
-      );
-      if (already) {
-        return interaction.reply({ content: `❌ Je hebt al een ticket: ${already}`, ephemeral: true });
-      }
+    await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
 
-      // Categorie ophalen/valideren
-      const { category, reason } = await resolveCategory(interaction.guild);
-      if (!category) {
-        console.warn(`ℹ️ Ticket wordt zonder categorie gemaakt: ${reason}`);
-      }
+    const welcomeEmbed = new EmbedBuilder()
+      .setColor('#8000ff')
+      .setTitle('🎟️ Thanks for opening a ticket!')
+      .setDescription('Support will be with you shortly 💜')
+      .setFooter({ text: 'Phantom Forge Support' });
 
-      const perms = [
-        { id: interaction.guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-        { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-      ];
-      if (SUPPORT_ROLE_ID) {
-        perms.push({ id: SUPPORT_ROLE_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] });
-      }
+    const ticketButtons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('claim_ticket_btn').setLabel('🟣 Claim Ticket').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('close_ticket_btn').setLabel('🟪 Close Ticket').setStyle(ButtonStyle.Primary)
+    );
 
-      const ch = await interaction.guild.channels.create({
-        name: `ticket-${interaction.user.id}`,
-        type: ChannelType.GuildText,
-        parent: category?.id || undefined, // alleen zetten als geldig
-        permissionOverwrites: perms,
-      });
+    const contentParts = [`${interaction.user}`];
+    if (supportRoleId) contentParts.push(`<@&${supportRoleId}>`);
 
-      // Paarse look embeds + knoppen
-      const info = new EmbedBuilder()
-        .setColor("#8000FF")
-        .setTitle("🎟️ Ticket geopend")
-        .setDescription(`Bedankt voor het openen van een ticket, <@${interaction.user.id}>.\nSupport <@&${SUPPORT_ROLE_ID}> helpt je zo 💜`);
+    await channel.send({
+      content: contentParts.join(' '),
+      allowedMentions: {
+        parse: [],
+        users: [userId],
+        roles: supportRoleId ? [supportRoleId.toString()] : []
+      },
+      embeds: [welcomeEmbed],
+      components: [ticketButtons]
+    });
 
-      const claimBtn = new ButtonBuilder()
-        .setCustomId("claim_ticket")
-        .setLabel("💜 Claim")
-        .setStyle(ButtonStyle.Primary); // paars/blurple
-
-      const closeBtn = new ButtonBuilder()
-        .setCustomId("close_ticket")
-        .setLabel("Close")
-        .setStyle(ButtonStyle.Danger);
-
-      await ch.send({
-        content: `<@${interaction.user.id}> ${SUPPORT_ROLE_ID ? `<@&${SUPPORT_ROLE_ID}>` : ""}`,
-        embeds: [info],
-        components: [new ActionRowBuilder().addComponents(claimBtn, closeBtn)],
-      });
-
-      await interaction.reply({ content: `✅ Ticket geopend: ${ch}`, ephemeral: true });
-      return;
-    }
-
-    // Claim
-    if (interaction.customId === "claim_ticket") {
-      await interaction.reply({
-        content: `💜 Hello <@${interaction.message.mentions?.users?.first()?.id || ""}> ik ben <@${interaction.user.id}> van het support team van Phantom Forge. Ik help je graag!`,
-      });
-      return;
-    }
-
-    // Close -> transcript upload
-    if (interaction.customId === "close_ticket") {
-      await interaction.deferReply({ ephemeral: true });
-      const channel = interaction.channel;
-      if (channel.type !== ChannelType.GuildText) {
-        return interaction.editReply({ content: "Dit werkt alleen in een ticketkanaal." });
-      }
-
-      // Berichten ophalen (laatste 100)
-      const msgs = await channel.messages.fetch({ limit: 100 });
-      const sorted = [...msgs.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-      // opener is de eerste @mention in het eerste ticketbericht (of probeer uit kanaalnaam)
-      let openerId = sorted[0]?.mentions?.users?.first()?.id || channel.name.split("ticket-")[1] || null;
-      const openerUser = openerId ? await client.users.fetch(openerId).catch(() => null) : null;
-
-      let url;
-      try {
-        url = await uploadTranscript({
-          guild: interaction.guild,
-          channel,
-          openerUser,
-          closerUser: interaction.user,
-          messages: sorted,
-        });
-      } catch (e) {
-        console.error("Transcript upload faalde:", e);
-        return interaction.editReply({ content: "❌ Upload naar website mislukte. Check je GITHUB_* env en repo/branch." });
-      }
-
-      // DM naar opener + meld in kanaal
-      if (openerUser) {
-        const dmEmbed = new EmbedBuilder()
-          .setColor("#8000FF")
-          .setTitle(`🎫 Ticket Closed on ${interaction.guild.name}`)
-          .setDescription(`Your ticket on **${interaction.guild.name}** has been closed.\nYou can view the transcript here:`);
-
-        const linkRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("📜 View Transcript").setURL(url)
-        );
-        await openerUser.send({ embeds: [dmEmbed], components: [linkRow] }).catch(() => {});
-      }
-
-      await interaction.editReply({ content: "✅ Transcript geüpload en verzonden. Kanaal sluit in 5s..." });
-      setTimeout(() => channel.delete("Ticket gesloten"), 5000);
-      return;
+    // anti-spam
+    await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
+    await channel.permissionOverwrites.edit(userId, { SendMessages: true }).catch(() => {});
+    if (supportRoleId) {
+      await channel.permissionOverwrites.edit(supportRoleId.toString(), { SendMessages: true }).catch(() => {});
     }
   } catch (err) {
-    console.error("Fout in interaction handler:", err);
-    if (interaction.isRepliable()) {
-      interaction.reply({ content: "Er is iets misgegaan.", ephemeral: true }).catch(() => {});
-    }
+    console.error('Fout bij open ticket:', err);
+    try { await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' }); } catch {}
+  } finally {
+    creatingTicketFor.delete(userId);
   }
-});
+}
 
-// =========================
-// Start
-// =========================
+async function handleClaim(interaction) {
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  if (!guild || channel?.type !== ChannelType.GuildText)
+    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
+  const meta = topicMetaToObj(channel.topic);
+  if (!meta.user) return interaction.reply({ content: 'Dit kanaal is geen ticket.', ephemeral: true });
+
+  const isSupport =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
+    (DEFAULT_SUPPORT_ROLE_ID && interaction.member.roles.cache.has(DEFAULT_SUPPORT_ROLE_ID.toString())) ||
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+  if (!isSupport) return interaction.reply({ content: 'Alleen support kan claimen.', ephemeral: true });
+
+  await channel.setTopic(makeTopic(meta.user, interaction.user.id));
+  await interaction.reply({ content: 'Ticket geclaimd ✅', ephemeral: true });
+
+  await channel.send(
+    `hello <@${meta.user}> i am ${interaction.user} from the support team of **Phantom Forge**. i am happy to help u!`
+  );
+}
+
+async function handleAdd(interaction) {
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  if (!guild || channel?.type !== ChannelType.GuildText)
+    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
+  const meta = topicMetaToObj(channel.topic);
+  if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
+
+  const user = interaction.options.getUser('user', true);
+
+  const isOwner = String(interaction.user.id) === meta.user;
+  const isSupport =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
+    (DEFAULT_SUPPORT_ROLE_ID && interaction.member.roles.cache.has(DEFAULT_SUPPORT_ROLE_ID.toString()));
+  const isAdmin =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+  if (!(isOwner || isSupport || isAdmin))
+    return interaction.reply({ content: 'Je mag geen personen toevoegen aan dit ticket.', ephemeral: true });
+
+  await channel.permissionOverwrites.edit(user.id, {
+    ViewChannel: true,
+    SendMessages: true,
+    ReadMessageHistory: true,
+    AttachFiles: true
+  });
+
+  await interaction.reply({ content: `${user} toegevoegd aan ticket ✅` });
+}
+
+async function handleClose(interaction) {
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  if (!guild || channel?.type !== ChannelType.GuildText)
+    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+
+  const meta = topicMetaToObj(channel.topic);
+  if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
+
+  const isOwner = String(interaction.user.id) === meta.user;
+  const isSupport =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
+    (DEFAULT_SUPPORT_ROLE_ID && interaction.member.roles.cache.has(DEFAULT_SUPPORT_ROLE_ID.toString()));
+  const isAdmin =
+    interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+  if (!(isOwner || isSupport || isAdmin))
+    return interaction.reply({ content: 'Je mag dit ticket niet sluiten.', ephemeral: true });
+
+  await interaction.deferReply({ ephemeral: true });
+
+  // Berichten ophalen
+  const messages = await channel.messages.fetch({ limit: 100 });
+  const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  // HTML transcript
+  const rows = sorted.map(m => {
+    const time = new Date(m.createdTimestamp).toLocaleString();
+    const name = m.author?.tag ?? m.author?.id ?? 'Unknown';
+    const content = (m.content || '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\n/g,'<br>');
+    const atts = m.attachments?.size
+      ? [...m.attachments.values()].map(a => `<a href="${a.url}" target="_blank" rel="noopener">📎 ${a.name}</a>`).join(' ')
+      : '';
+    return `<div class="msg"><div class="meta">[${time}] <b>${name}</b></div><div class="text">${content} ${atts}</div></div>`;
+  }).join('\n');
+
+  const html = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Transcript #${channel.name}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{background:#0f0f14;color:#eaeaf0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;margin:0;padding:24px;}
+  .wrap{max-width:900px;margin:0 auto;}
+  h1{margin:0 0 6px;font-size:22px}
+  .sub{opacity:.8;margin:0 0 18px;font-size:13px}
+  .msg{background:#181826;border:1px solid #2a2a40;border-radius:12px;padding:12px 14px;margin:10px 0}
+  .meta{color:#9aa0a6;font-size:12px;margin-bottom:6px}
+  .text{font-size:14px;line-height:1.4;word-break:break-word}
+  a{color:#8a5fff}
+</style></head>
+<body><div class="wrap">
+  <h1>Transcript #${channel.name}</h1>
+  <div class="sub">Closed by: ${interaction.user.tag} (${interaction.user.id}) · Guild: ${guild.name}</div>
+  ${rows || '<i>No content</i>'}
+</div></body></html>`;
+
+  // Upload naar Gist (secret)
+  const filename = `${channel.name}-${Date.now()}.html`;
+  let url;
+  try {
+    url = await uploadTranscriptToGist(filename, html, false);
+  } catch (e) {
+    console.error(e);
+    return interaction.editReply({ content: '❌ Upload naar website (Gist) mislukte.' });
+  }
+
+  // DM embed + knop (geen link in het ticket)
+  const user = await client.users.fetch(meta.user).catch(() => null);
+  const transcriptEmbed = new EmbedBuilder()
+    .setColor('#8000ff')
+    .setTitle(`🎫 Ticket Closed on ${guild.name}`)
+    .setDescription(`Your ticket on the server **${guild.name}** has been closed.\nYou can view the transcript here:`)
+    .setFooter({ text: 'Phantom Forge Support' });
+
+  const button = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('📜 View Transcript').setStyle(ButtonStyle.Link).setURL(url)
+  );
+
+  let dmOk = false;
+  if (user) {
+    dmOk = await user.send({ embeds: [transcriptEmbed], components: [button] })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  if (dmOk) {
+    await channel.send({ content: '✅ Ticket wordt gesloten. Transcript is per DM naar de opener gestuurd.' }).catch(() => {});
+  } else {
+    await channel.send({ content: 'ℹ️ Ticket wordt gesloten. Kon geen DM sturen naar de opener (DMs uit?).' }).catch(() => {});
+  }
+
+  await interaction.editReply({ content: '✅ Afgerond. Kanaal wordt verwijderd…' });
+
+  setTimeout(async () => {
+    try { await channel.delete('Ticket gesloten en transcript via DM verstuurd.'); } catch {}
+  }, 5000);
+}
+
+// ========== LOGIN ==========
 client.login(TOKEN);
