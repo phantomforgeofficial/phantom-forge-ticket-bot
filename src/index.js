@@ -20,7 +20,7 @@ const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
 
 if (!TOKEN) {
-  console.error('❌ Zet DISCORD_TOKEN in je .env!');
+  console.error('❌ Please set DISCORD_TOKEN in your .env');
   process.exit(1);
 }
 
@@ -34,7 +34,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ===== Locks om dubbele acties te voorkomen =====
+// ===== Locks to prevent duplicates =====
 const creatingTicketFor = new Set();     // per user
 const processingInteraction = new Set(); // per interaction
 
@@ -86,21 +86,21 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
 const commands = [
   {
     name: 'panel',
-    description: 'Stuur een ticketpaneel in dit kanaal',
+    description: 'Send a ticket panel in this channel',
     options: [
-      { name: 'support_role', description: 'Support-rol die tickets mag zien', type: 8, required: false },
-      { name: 'category', description: 'Categorie voor ticketkanalen', type: 7, channel_types: [4], required: false },
-      { name: 'title', description: 'Titel van het paneel', type: 3, required: false },
-      { name: 'description', description: 'Beschrijving onder het paneel', type: 3, required: false }
+      { name: 'support_role', description: 'Support role that can access tickets', type: 8, required: false },
+      { name: 'category', description: 'Category to create ticket channels in', type: 7, channel_types: [4], required: false },
+      { name: 'title', description: 'Panel title', type: 3, required: false },
+      { name: 'description', description: 'Panel description', type: 3, required: false }
     ]
   },
-  { name: 'claim', description: 'Claim dit ticket (alleen support)' },
+  { name: 'claim', description: 'Claim this ticket (support only)' },
   {
     name: 'add',
-    description: 'Voeg een gebruiker toe aan dit ticket',
-    options: [{ name: 'user', description: 'Gebruiker om toe te voegen', type: 6, required: true }]
+    description: 'Add a user to this ticket',
+    options: [{ name: 'user', description: 'User to add', type: 6, required: true }]
   },
-  { name: 'close', description: 'Sluit dit ticket' }
+  { name: 'close', description: 'Close this ticket' }
 ];
 
 async function registerCommands() {
@@ -109,19 +109,19 @@ async function registerCommands() {
     const app = await client.application?.fetch();
     if (GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
-      console.log('✅ Guild commands gesynchroniseerd');
+      console.log('✅ Synced guild commands');
     } else {
       await rest.put(Routes.applicationCommands(app.id), { body: commands });
-      console.log('✅ Globale commands gesynchroniseerd');
+      console.log('✅ Synced global commands');
     }
   } catch (e) {
-    console.error('Fout bij command sync:', e);
+    console.error('Command sync error:', e);
   }
 }
 
 // ================== Ready ==================
 client.once('ready', async () => {
-  console.log(`✅ Ingelogd als ${client.user.tag}`);
+  console.log(`✅ Logged in as ${client.user.tag}`);
   await registerCommands();
 });
 
@@ -145,7 +145,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (e) {
     console.error(e);
-    const msg = { content: 'Er ging iets mis.', ephemeral: true };
+    const msg = { content: 'Something went wrong.', ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(msg).catch(() => {});
     else await interaction.reply(msg).catch(() => {});
   } finally {
@@ -159,7 +159,7 @@ async function handlePanel(interaction) {
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)
   ) {
-    return interaction.reply({ content: 'Je hebt beheerderrechten nodig.', ephemeral: true });
+    return interaction.reply({ content: 'You need Manage Server/Channels to use this.', ephemeral: true });
   }
 
   await interaction.deferReply({ ephemeral: true });
@@ -167,7 +167,7 @@ async function handlePanel(interaction) {
   const supportRole = interaction.options.getRole('support_role');
   const category = interaction.options.getChannel('category');
   const title = interaction.options.getString('title') ?? 'Phantom Forge Support';
-  const description = interaction.options.getString('description') ?? 'Klik op de knop om een privé-ticket te openen.';
+  const description = interaction.options.getString('description') ?? 'Click the button to open a private ticket.';
 
   const supportRoleId = supportRole?.id ? BigInt(supportRole.id) : DEFAULT_SUPPORT_ROLE_ID;
   const categoryId = category?.id ? BigInt(category.id) : DEFAULT_CATEGORY_ID;
@@ -185,22 +185,22 @@ async function handlePanel(interaction) {
   const existingPanel = await findExistingPanelMessage(interaction.channel, supportRoleId, categoryId);
   if (existingPanel) {
     await existingPanel.edit({ embeds: [embed], components: [row] }).catch(() => {});
-    await interaction.editReply('Bestaand ticketpaneel geüpdatet ✅');
+    await interaction.editReply('Updated existing ticket panel ✅');
   } else {
     await interaction.channel.send({ embeds: [embed], components: [row] });
-    await interaction.editReply('Ticketpaneel geplaatst ✅');
+    await interaction.editReply('Ticket panel posted ✅');
   }
 }
 
 async function handleOpenTicket(interaction) {
   const guild = interaction.guild;
-  if (!guild) return interaction.reply({ content: 'Niet in een server.', ephemeral: true });
+  if (!guild) return interaction.reply({ content: 'This can only be used in a server.', ephemeral: true });
 
   await interaction.deferReply({ ephemeral: true });
   const userId = interaction.user.id;
 
   if (creatingTicketFor.has(userId)) {
-    return interaction.editReply({ content: 'Je ticket is al in aanmaak… ⏳' });
+    return interaction.editReply({ content: 'Your ticket is already being created… ⏳' });
   }
   creatingTicketFor.add(userId);
 
@@ -209,7 +209,7 @@ async function handleOpenTicket(interaction) {
     const existing = allChannels.find(
       ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
     );
-    if (existing) return interaction.editReply({ content: `Je hebt al een open ticket: ${existing}` });
+    if (existing) return interaction.editReply({ content: `You already have an open ticket: ${existing}` });
 
     const emb = interaction.message.embeds?.[0];
     const { supportRoleId, categoryId } = parseFooter(emb);
@@ -242,7 +242,7 @@ async function handleOpenTicket(interaction) {
       permissionOverwrites: overwrites
     });
 
-    await interaction.editReply({ content: `✅ Ticket aangemaakt: ${channel}` });
+    await interaction.editReply({ content: `✅ Ticket created: ${channel}` });
 
     const welcomeEmbed = new EmbedBuilder()
       .setColor('#8000ff')
@@ -269,8 +269,8 @@ async function handleOpenTicket(interaction) {
       components: [ticketButtons]
     });
   } catch (err) {
-    console.error('Fout bij open ticket:', err);
-    try { await interaction.editReply({ content: 'Er ging iets mis bij het aanmaken van je ticket.' }); } catch {}
+    console.error('Open ticket error:', err);
+    try { await interaction.editReply({ content: 'Something went wrong creating your ticket.' }); } catch {}
   } finally {
     creatingTicketFor.delete(userId);
   }
@@ -280,16 +280,16 @@ async function handleClaim(interaction) {
   const channel = interaction.channel;
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
 
   const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'Dit kanaal is geen ticket.', ephemeral: true });
+  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
 
   await channel.setTopic(makeTopic(meta.user, interaction.user.id));
-  await interaction.reply({ content: 'Ticket geclaimd ✅', ephemeral: true });
+  await interaction.reply({ content: 'Ticket claimed ✅', ephemeral: true });
 
   await channel.send(
-    `hello <@${meta.user}> i am ${interaction.user} from the support team of **Phantom Forge**. i am happy to help u!`
+    `Hello <@${meta.user}> — I am ${interaction.user} from the **Phantom Forge** support team. Happy to help!`
   );
 }
 
@@ -297,10 +297,10 @@ async function handleAdd(interaction) {
   const channel = interaction.channel;
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
 
   const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
+  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
 
   const user = interaction.options.getUser('user', true);
 
@@ -313,7 +313,7 @@ async function handleAdd(interaction) {
     interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
 
   if (!(isOwner || isSupport || isAdmin))
-    return interaction.reply({ content: 'Je mag geen personen toevoegen aan dit ticket.', ephemeral: true });
+    return interaction.reply({ content: 'You are not allowed to add people to this ticket.', ephemeral: true });
 
   await channel.permissionOverwrites.edit(user.id, {
     ViewChannel: true,
@@ -322,24 +322,24 @@ async function handleAdd(interaction) {
     AttachFiles: true
   });
 
-  await interaction.reply({ content: `${user} toegevoegd aan ticket ✅` });
+  await interaction.reply({ content: `${user} has been added to the ticket ✅`, ephemeral: true });
 }
 
 async function handleClose(interaction) {
   const channel = interaction.channel;
   const guild = interaction.guild;
   if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Gebruik dit in een ticketkanaal.', ephemeral: true });
+    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
 
   const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'Geen ticket.', ephemeral: true });
+  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
 
   await interaction.deferReply({ ephemeral: true });
 
-  // ===== Transcript opbouwen (laatste 100 berichten) =====
+  // Build transcript (last 100 messages)
   const messages = await channel.messages.fetch({ limit: 100 });
   const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  let txt = `Transcript van #${channel.name}\n\n`;
+  let txt = `Transcript of #${channel.name}\n\n`;
   for (const m of sorted) {
     const atts = m.attachments?.size
       ? ' ' + [...m.attachments.values()].map(a => `[attachment:${a.name}]`).join(' ')
@@ -348,30 +348,29 @@ async function handleClose(interaction) {
   }
   const buffer = Buffer.from(txt, 'utf-8');
 
-  // ===== DM naar ticket-opener =====
+  // DM transcript to ticket opener
   let dmOk = false;
   try {
     const user = await client.users.fetch(meta.user);
     await user.send({
-      content: `🗂️ Hier is de transcript van je ticket **#${channel.name}**.`,
+      content: `🗂️ Here is the transcript for your ticket **#${channel.name}**.`,
       files: [{ attachment: buffer, name: `${channel.name}-transcript.txt` }]
     });
     dmOk = true;
-  } catch (e) {
-    dmOk = false; // DM gesloten / mislukt
+  } catch {
+    dmOk = false;
   }
 
-  // Antwoord aan de sluiter (ephemeral) en daarna kanaal sluiten
   if (dmOk) {
-    await interaction.editReply({ content: 'Transcript is per DM verstuurd ✅ Kanaal wordt gesloten…' });
+    await interaction.editReply({ content: 'Transcript sent via DM ✅ Closing channel…' });
   } else {
     await interaction.editReply({
-      content: 'Kon geen DM sturen (gebruiker blokkeert DM’s). Kanaal wordt toch gesloten.'
+      content: 'Could not DM the transcript (user has DMs off). Closing channel anyway.'
     });
   }
 
   setTimeout(async () => {
-    try { await channel.delete('Ticket gesloten.'); } catch {}
+    try { await channel.delete('Ticket closed.'); } catch {}
   }, 4000);
 }
 
