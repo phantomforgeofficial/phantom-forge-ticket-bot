@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import http from 'node:http';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -374,4 +375,22 @@ async function handleClose(interaction) {
   }, 4000);
 }
 
+// --------------- Tiny HTTP server for Render Free Web Service ---------------
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    // simple health endpoint
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Phantom Forge Ticket Bot is running.\n');
+  })
+  .listen(PORT, () => {
+    console.log(`🌐 HTTP server listening on port ${PORT} (required for Render free web service)`);
+  });
+
+// --------------- Login ---------------
 client.login(TOKEN);
