@@ -58,7 +58,11 @@ const client = new Client({
 });
 
 const creatingTicketFor = new Set();
-let lastStatusMessage = null; // status-embed bericht-id
+
+// Status embed caching/lock
+let lastStatusMessageId = null;   // id, nuttig na reboot
+let lastStatusMessageObj = null;  // gecached Message object
+let statusEditInFlight = false;   // simpele lock
 
 // === HELPERS ===
 function topicMetaToObj(topic) {
@@ -187,7 +191,7 @@ client.once('ready', async () => {
   await setWatchingPresence();
   await registerCommands();
 
-  // Start status loop: 1 Hz live updates
+  // Start status loop: live updates (1 Hz)
   postStatus().catch(() => {});
   setInterval(() => postStatus().catch(() => {}), 1000);
 });
@@ -196,37 +200,84 @@ client.once('ready', async () => {
 client.on('guildCreate', () => setWatchingPresence().catch(() => {}));
 client.on('guildDelete', () => setWatchingPresence().catch(() => {}));
 
+// === Status message ensure (cache/restore/self-heal) ===
+async function ensureStatusMessage() {
+  if (lastStatusMessageObj && !lastStatusMessageObj.deleted) return lastStatusMessageObj;
+
+  const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return null;
+
+  // 1) direct fetch via id
+  if (lastStatusMessageId) {
+    const msg = await ch.messages.fetch(lastStatusMessageId).catch(() => null);
+    if (msg) { lastStatusMessageObj = msg; return msg; }
+  }
+
+  // 2) zoek recent bericht van deze bot met juiste titel
+  const recent = await ch.messages.fetch({ limit: 20 }).catch(() => null);
+  if (recent) {
+    const mine = [...recent.values()].find(m =>
+      m.author?.id === client.user.id &&
+      m.embeds?.[0]?.title?.includes('Phantom Forge Ticket Bot Status')
+    );
+    if (mine) {
+      lastStatusMessageObj = mine;
+      lastStatusMessageId = mine.id;
+      return mine;
+    }
+  }
+
+  // 3) maak een nieuwe
+  const placeholder = new EmbedBuilder()
+    .setColor('#00ff88')
+    .setTitle('🕒 Phantom Forge Ticket Bot Status')
+    .setDescription('Booting status…')
+    .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() });
+
+  const newMsg = await ch.send({ embeds: [placeholder] }).catch(() => null);
+  if (newMsg) {
+    lastStatusMessageObj = newMsg;
+    lastStatusMessageId = newMsg.id;
+    return newMsg;
+  }
+  return null;
+}
+
 // === LIVE STATUS EMBED (every second, with ping) ===
 async function postStatus() {
   if (!STATUS_CHANNEL_ID) return;
-  const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
-  if (!ch || ch.type !== ChannelType.GuildText) return;
-
-  const active = client.isReady();
-  const uptimeStr = formatUptime(client.uptime ?? 0);
-  const now = new Date().toLocaleString('en-US');
-  const pingMs = Math.max(0, Math.round(client.ws.ping)); // WebSocket ping
-
-  const embed = new EmbedBuilder()
-    .setColor(active ? '#00ff88' : '#ff0055')
-    .setTitle('🕒 Phantom Forge Ticket Bot Status')
-    .setDescription([
-      `**Active:** ${active ? '✅ Online' : '❌ Offline'}`,
-      `**Uptime:** \`${uptimeStr}\``,
-      `**Ping:** \`${pingMs} ms\``,
-      `**Last update:** ${now}`
-    ].join('\n'))
-    .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() });
+  if (statusEditInFlight) return;  // voorkom overlap
+  statusEditInFlight = true;
 
   try {
-    if (lastStatusMessage) {
-      const msg = await ch.messages.fetch(lastStatusMessage).catch(() => null);
-      if (msg) { await msg.edit({ embeds: [embed] }); return; }
-    }
-    const newMsg = await ch.send({ embeds: [embed] });
-    lastStatusMessage = newMsg.id;
-  } catch (e) {
-    console.error('Error updating status embed:', e);
+    const msg = await ensureStatusMessage();
+    if (!msg) return;
+
+    const active = client.isReady();
+    const uptimeStr = formatUptime(client.uptime ?? 0);
+    const now = new Date().toLocaleString('en-US');
+    const pingMs = Math.max(0, Math.round(client.ws.ping));
+
+    const embed = new EmbedBuilder()
+      .setColor(active ? '#00ff88' : '#ff0055')
+      .setTitle('🕒 Phantom Forge Ticket Bot Status')
+      .setDescription([
+        `**Active:** ${active ? '✅ Online' : '❌ Offline'}`,
+        `**Uptime:** \`${uptimeStr}\``,
+        `**Ping:** \`${pingMs} ms\``,
+        `**Last update:** ${now}`
+      ].join('\n'))
+      .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() });
+
+    await msg.edit({ embeds: [embed] }).catch(async () => {
+      // Als het bestaande bericht niet meer kan worden bewerkt -> reset en opnieuw aanmaken
+      lastStatusMessageObj = null;
+      lastStatusMessageId = null;
+      const again = await ensureStatusMessage();
+      if (again) await again.edit({ embeds: [embed] }).catch(() => {});
+    });
+  } finally {
+    statusEditInFlight = false;
   }
 }
 
@@ -617,7 +668,7 @@ server.listen(PORT, () => {
   console.log(`🌐 HTTP server listening on port ${PORT} (Render free web service)`);
 });
 
-// === KEEP-ALIVE SELF-PING ===
+// === KEEP-ALIVE SELF-PING (voor lokale tests; extern UptimeRobot/GitHub Actions houdt hem wakker) ===
 const externalBase =
   process.env.RENDER_EXTERNAL_URL || process.env.KEEPALIVE_URL || `http://localhost:${PORT}`;
 const KEEPALIVE_URL = `${externalBase.replace(/\/$/, '')}/health`;
