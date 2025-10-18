@@ -14,7 +14,8 @@ import {
   Partials,
   PermissionsBitField,
   REST,
-  Routes
+  Routes,
+  ActivityType
 } from 'discord.js';
 
 // === ENVIRONMENT VARS ===
@@ -22,7 +23,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
-const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || ''; // e.g. "1429121620194234478"
+const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || '';
 const MAX_TRANSCRIPT_MESSAGES = Number(process.env.MAX_TRANSCRIPT_MESSAGES || 1000); // >100 supported
 const TRANSCRIPT_TTL_MS = Number(process.env.TRANSCRIPT_TTL_MS || 7 * 24 * 60 * 60 * 1000); // 7d
 
@@ -31,24 +32,19 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-// === TRANSCRIPT STORE (in-memory, served via /t/:id) ===
+// === TRANSCRIPT STORE (in-memory /t/:id) ===
 /** @type {Map<string, {html:string, filename:string, ts:number}>} */
 const transcripts = new Map();
-function makeId() {
-  return randomBytes(12).toString('hex'); // 24 chars
-}
+function makeId() { return randomBytes(12).toString('hex'); }
 function putTranscript(html, filename) {
   const id = makeId();
   transcripts.set(id, { html, filename, ts: Date.now() });
   return id;
 }
-function gcTranscripts() {
+setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of transcripts) {
-    if (now - v.ts > TRANSCRIPT_TTL_MS) transcripts.delete(k);
-  }
-}
-setInterval(gcTranscripts, 60 * 60 * 1000); // hourly GC
+  for (const [k, v] of transcripts) if (now - v.ts > TRANSCRIPT_TTL_MS) transcripts.delete(k);
+}, 60 * 60 * 1000);
 
 // === DISCORD CLIENT ===
 const client = new Client({
@@ -110,6 +106,35 @@ function formatUptime(ms) {
   return `${hh}:${mm}:${ss}`;
 }
 
+// Resolve mentions to readable labels per message
+function resolveMentionsInContent(content, message) {
+  if (!content) return '';
+  let out = content;
+
+  // users <@123> or <@!123>
+  out = out.replace(/<@!?(\d+)>/g, (match, id) => {
+    const u = message.mentions?.users?.get(id);
+    if (u) return `@${u.tag}`;
+    return `@user:${id}`;
+  });
+
+  // channels <#123>
+  out = out.replace(/<#(\d+)>/g, (match, id) => {
+    const c = message.mentions?.channels?.get(id) || message.guild?.channels?.cache.get(id);
+    if (c) return `#${c.name}`;
+    return `#channel:${id}`;
+  });
+
+  // roles <@&123>
+  out = out.replace(/<@&(\d+)>/g, (match, id) => {
+    const r = message.mentions?.roles?.get(id) || message.guild?.roles?.cache.get(id);
+    if (r) return `@${r.name}`;
+    return `@role:${id}`;
+  });
+
+  return out;
+}
+
 // === SLASH COMMANDS ===
 const commands = [
   {
@@ -145,13 +170,27 @@ async function registerCommands() {
 }
 
 // === READY ===
+function computePresenceGuildName() {
+  const preferred = GUILD_ID ? client.guilds.cache.get(GUILD_ID) : null;
+  const g = preferred || client.guilds.cache.first();
+  return g?.name || 'the server';
+}
+async function setWatchingPresence() {
+  const name = computePresenceGuildName();
+  client.user.setPresence({ status: 'online', activities: [{ name, type: ActivityType.Watching }] });
+}
+
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  client.user.setPresence({ status: 'online', activities: [{ name: 'Phantom Forge Tickets', type: 0 }] });
+  await setWatchingPresence();
   await registerCommands();
   postStatus().catch(() => {});
   setInterval(() => postStatus().catch(() => {}), 10 * 60 * 1000);
 });
+
+// Update presence when bot joins/leaves servers
+client.on('guildCreate', () => setWatchingPresence().catch(() => {}));
+client.on('guildDelete', () => setWatchingPresence().catch(() => {}));
 
 async function postStatus() {
   if (!STATUS_CHANNEL_ID) return;
@@ -311,7 +350,7 @@ async function fetchAllMessages(channel, maxCount) {
     if (!batch || batch.size === 0) break;
     const arr = [...batch.values()];
     collected.push(...arr);
-    beforeId = arr[arr.length - 1].id; // next page before the oldest
+    beforeId = arr[arr.length - 1].id;
     if (batch.size < 100) break;
   }
   return collected;
@@ -328,21 +367,25 @@ async function handleClose(interaction) {
   const fetched = await fetchAllMessages(channel, Math.max(101, MAX_TRANSCRIPT_MESSAGES));
   const sorted = fetched.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
-  const renderMsgs = sorted.map(m => ({
-    authorName: m.author?.tag ?? 'Unknown',
-    authorAvatar: m.author?.displayAvatarURL({ extension: 'webp', size: 128 }) ?? '',
-    timestamp: formatDate(m.createdTimestamp),
-    content: m.content ?? '',
-    attachments: [...m.attachments.values()].map(a => ({ url: a.url, name: a.name })),
-    embed: m.embeds[0]
-      ? {
-          title: m.embeds[0].title ?? '',
-          description: m.embeds[0].description ?? '',
-          footer: m.embeds[0].footer?.text ?? '',
-          colorHex: toHexColor(m.embeds[0].color)
-        }
-      : null
-  }));
+  const renderMsgs = sorted.map(m => {
+    const raw = m.content ?? '';
+    const content = resolveMentionsInContent(raw, m); // <-- mentions naar leesbare labels
+    return {
+      authorName: m.author?.tag ?? 'Unknown',
+      authorAvatar: m.author?.displayAvatarURL({ extension: 'webp', size: 128 }) ?? '',
+      timestamp: formatDate(m.createdTimestamp),
+      content,
+      attachments: [...m.attachments.values()].map(a => ({ url: a.url, name: a.name })),
+      embed: m.embeds[0]
+        ? {
+            title: m.embeds[0].title ?? '',
+            description: m.embeds[0].description ?? '',
+            footer: m.embeds[0].footer?.text ?? '',
+            colorHex: toHexColor(m.embeds[0].color)
+          }
+        : null
+    };
+  });
 
   const html = buildTranscriptHTML({
     channelName: channel.name,
@@ -355,14 +398,14 @@ async function handleClose(interaction) {
   const filename = `${channel.name}-transcript.html`;
   const id = putTranscript(html, filename);
 
-  // Build public URL (keepalive base or external)
+  // Public URL
   const base =
     process.env.RENDER_EXTERNAL_URL ||
     process.env.KEEPALIVE_URL ||
     `http://localhost:${process.env.PORT || 3000}`;
   const downloadUrl = `${base.replace(/\/$/, '')}/t/${id}`;
 
-  // DM embed to ticket opener with link button
+  // DM embed + link button
   const guildName = interaction.guild?.name ?? 'our server';
   const dmEmbed = new EmbedBuilder()
     .setColor('#8000ff')
@@ -374,10 +417,7 @@ async function handleClose(interaction) {
     ].join('\n'));
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setStyle(ButtonStyle.Link)
-      .setLabel('Download Transcript')
-      .setURL(downloadUrl)
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Download Transcript').setURL(downloadUrl)
   );
 
   let dmOk = false;
@@ -393,7 +433,7 @@ async function handleClose(interaction) {
   setTimeout(() => channel.delete('Ticket closed.'), 5000);
 }
 
-// === BUILD TRANSCRIPT HTML (neon purple title + theme + logo) ===
+// === BUILD TRANSCRIPT HTML (neon purple titel + thema + logo) ===
 function buildTranscriptHTML({ channelName, closedByTag, closedAt, messages }) {
   const LOGO_URL = 'https://i.postimg.cc/HkfVrFF8/Schermafbeelding-2025-10-16-170745-removebg-preview.png';
   const header = `
@@ -419,8 +459,6 @@ body{
 .logo{width:56px;height:56px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(128,0,255,.6))}
 h1{
   margin:0;font-size:24px;color:#fff;
-  /* Neon paarse titel (met accent) */
-  color:#fff;
   text-shadow:
     0 0 2px #fff,
     0 0 6px var(--accent),
@@ -511,7 +549,7 @@ h1{
   return header + items + footer;
 }
 
-// === HTTP SERVER FOR RENDER + TRANSCRIPT DOWNLOAD ===
+// === HTTP SERVER (health + transcript download) ===
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
   try {
@@ -539,7 +577,6 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // default
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Phantom Forge Ticket Bot is running.\n');
   } catch (err) {
