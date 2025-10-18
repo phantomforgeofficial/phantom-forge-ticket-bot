@@ -38,9 +38,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// Prevent duplicates
 const creatingTicketFor = new Set();
-const processingInteraction = new Set();
 
 // === HELPERS ===
 function topicMetaToObj(topic) {
@@ -70,16 +68,16 @@ function parseFooter(embed) {
   } catch {}
   return out;
 }
-async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
-  const targetFooter = panelFooterText(supportRoleId, categoryId);
-  const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-  if (!msgs) return null;
-  for (const m of msgs.values()) {
-    if (m.author?.id !== channel.client.user.id) continue;
-    const emb = m.embeds?.[0];
-    if (emb?.footer?.text === targetFooter) return m;
-  }
-  return null;
+function escapeHtml(str) {
+  return (str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function formatDate(d) {
+  try { return new Date(d).toLocaleString('en-US'); } catch { return new Date(d).toISOString(); }
+}
+function toHexColor(num) {
+  if (typeof num !== 'number') return null;
+  return '#' + num.toString(16).padStart(6, '0');
 }
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
@@ -88,19 +86,6 @@ function formatUptime(ms) {
   const ss = String(s % 60).padStart(2, '0');
   return `${hh}:${mm}:${ss}`;
 }
-function escapeHtml(str) {
-  return (str ?? '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-function toHexColor(num) {
-  if (typeof num !== 'number') return null;
-  return '#' + num.toString(16).padStart(6, '0');
-}
-function formatDate(d) {
-  try { return new Date(d).toLocaleString('en-US'); } catch { return new Date(d).toISOString(); }
-}
 
 // === SLASH COMMANDS ===
 const commands = [
@@ -108,8 +93,8 @@ const commands = [
     name: 'panel',
     description: 'Send a ticket panel in this channel',
     options: [
-      { name: 'support_role', description: 'Support role that can access tickets', type: 8, required: false },
-      { name: 'category', description: 'Category to create ticket channels in', type: 7, channel_types: [4], required: false },
+      { name: 'support_role', description: 'Support role', type: 8, required: false },
+      { name: 'category', description: 'Ticket category', type: 7, channel_types: [4], required: false },
       { name: 'title', description: 'Panel title', type: 3, required: false },
       { name: 'description', description: 'Panel description', type: 3, required: false }
     ]
@@ -128,8 +113,10 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
     const app = await client.application?.fetch();
-    if (GUILD_ID) await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
-    else await rest.put(Routes.applicationCommands(app.id), { body: commands });
+    if (GUILD_ID)
+      await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
+    else
+      await rest.put(Routes.applicationCommands(app.id), { body: commands });
     console.log('✅ Slash commands synced');
   } catch (e) { console.error('Command sync error:', e); }
 }
@@ -139,8 +126,6 @@ client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   client.user.setPresence({ status: 'online', activities: [{ name: 'Phantom Forge Tickets', type: 0 }] });
   await registerCommands();
-
-  // Status-loop (log channel)
   postStatus().catch(() => {});
   setInterval(() => postStatus().catch(() => {}), 10 * 60 * 1000);
 });
@@ -151,7 +136,7 @@ async function postStatus() {
   if (!ch || ch.type !== ChannelType.GuildText) return;
   const active = client.isReady();
   const uptimeStr = formatUptime(client.uptime ?? 0);
-  const content = ['Phantom Forge Ticket Bot', `active: ${active ? 'true' : 'false'}`, `uptime: ${uptimeStr}`].join('\n');
+  const content = `Phantom Forge Ticket Bot\nactive: ${active ? 'true' : 'false'}\nuptime: ${uptimeStr}`;
   await ch.send({ content }).catch(() => {});
 }
 
@@ -188,17 +173,16 @@ async function handleUptime(interaction) {
   await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
-// === PANEL / TICKETS ===
+// === PANEL ===
 async function handlePanel(interaction) {
-  if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
-      !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels))
-    return interaction.reply({ content: 'You need Manage Server/Channels to use this.', ephemeral: true });
+  if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild))
+    return interaction.reply({ content: 'You need Manage Server permissions.', ephemeral: true });
 
   await interaction.deferReply({ ephemeral: true });
   const supportRole = interaction.options.getRole('support_role');
   const category = interaction.options.getChannel('category');
   const title = interaction.options.getString('title') ?? 'Phantom Forge Support';
-  const description = interaction.options.getString('description') ?? 'Click the button to open a private ticket.';
+  const description = interaction.options.getString('description') ?? 'Click below to open a ticket.';
 
   const supportRoleId = supportRole?.id ? BigInt(supportRole.id) : DEFAULT_SUPPORT_ROLE_ID;
   const categoryId = category?.id ? BigInt(category.id) : DEFAULT_CATEGORY_ID;
@@ -211,47 +195,34 @@ async function handlePanel(interaction) {
     new ButtonBuilder().setCustomId('open_ticket_btn').setLabel('🎟️ Open Ticket').setStyle(ButtonStyle.Secondary)
   );
 
-  const existingPanel = await findExistingPanelMessage(interaction.channel, supportRoleId, categoryId);
-  if (existingPanel) {
-    await existingPanel.edit({ embeds: [embed], components: [row] }).catch(() => {});
-    await interaction.editReply('Updated existing ticket panel ✅');
-  } else {
-    await interaction.channel.send({ embeds: [embed], components: [row] });
-    await interaction.editReply('Ticket panel posted ✅');
-  }
+  await interaction.channel.send({ embeds: [embed], components: [row] });
+  await interaction.editReply('✅ Ticket panel posted');
 }
 
+// === OPEN TICKET ===
 async function handleOpenTicket(interaction) {
   const guild = interaction.guild;
-  if (!guild) return interaction.reply({ content: 'This can only be used in a server.', ephemeral: true });
+  if (!guild) return interaction.reply({ content: 'Server only.', ephemeral: true });
 
   await interaction.deferReply({ ephemeral: true });
   const userId = interaction.user.id;
-
-  if (creatingTicketFor.has(userId)) return interaction.editReply({ content: 'Your ticket is already being created… ⏳' });
+  if (creatingTicketFor.has(userId)) return interaction.editReply('Ticket already being created…');
   creatingTicketFor.add(userId);
 
   try {
-    const allChannels = await guild.channels.fetch();
-    const existing = allChannels.find(
-      ch => ch?.type === ChannelType.GuildText && ch.topic && topicMetaToObj(ch.topic).user === String(userId)
-    );
-    if (existing) return interaction.editReply({ content: `You already have an open ticket: ${existing}` });
-
     const emb = interaction.message.embeds?.[0];
     const { supportRoleId, categoryId } = parseFooter(emb);
-
     const baseName = `ticket-${interaction.user.username}`.toLowerCase().replace(/\s+/g, '-').slice(0, 90);
 
     const overwrites = [
       { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel], type: OverwriteType.Role },
       { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member },
-      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles], type: OverwriteType.Member }
+      { id: guild.members.me.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory], type: OverwriteType.Member }
     ];
     if (supportRoleId) {
       overwrites.push({
         id: supportRoleId.toString(),
-        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles],
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
         type: OverwriteType.Role
       });
     }
@@ -264,127 +235,137 @@ async function handleOpenTicket(interaction) {
       permissionOverwrites: overwrites
     });
 
-    await interaction.editReply({ content: `✅ Ticket created: ${channel}` });
-
-    const welcomeEmbed = new EmbedBuilder()
+    const embed = new EmbedBuilder()
       .setColor('#8000ff')
       .setTitle('🎟️ Thanks for opening a ticket!')
-      .setDescription('Support will be with you shortly 💜')
-      .setFooter({ text: 'Phantom Forge Support' });
+      .setDescription('Support will be with you shortly 💜');
 
-    const ticketButtons = new ActionRowBuilder().addComponents(
+    const buttons = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('claim_ticket_btn').setLabel('🟣 Claim Ticket').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('close_ticket_btn').setLabel('🟪 Close Ticket').setStyle(ButtonStyle.Primary)
     );
 
-    const contentParts = [`${interaction.user}`];
-    if (supportRoleId) contentParts.push(`<@&${supportRoleId}>`);
-
     await channel.send({
-      content: contentParts.join(' '),
-      allowedMentions: { parse: [], users: [userId], roles: supportRoleId ? [supportRoleId.toString()] : [] },
-      embeds: [welcomeEmbed],
-      components: [ticketButtons]
+      content: `${interaction.user}${supportRoleId ? ` <@&${supportRoleId}>` : ''}`,
+      embeds: [embed],
+      components: [buttons]
     });
-  } catch (err) {
-    console.error('Open ticket error:', err);
-    try { await interaction.editReply({ content: 'Something went wrong creating your ticket.' }); } catch {}
-  } finally { creatingTicketFor.delete(userId); }
+
+    await interaction.editReply({ content: `✅ Ticket created: ${channel}` });
+  } catch (e) {
+    console.error(e);
+    await interaction.editReply('Error creating ticket.');
+  } finally {
+    creatingTicketFor.delete(userId);
+  }
 }
 
+// === CLAIM ===
 async function handleClaim(interaction) {
-  const channel = interaction.channel;
-  const guild = interaction.guild;
-  if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
-
-  const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
-
-  await channel.setTopic(makeTopic(meta.user, interaction.user.id));
-  await interaction.reply({ content: 'Ticket claimed ✅', ephemeral: true });
-  await channel.send(`Hello <@${meta.user}> — I am ${interaction.user} from the **Phantom Forge** support team. Happy to help!`);
+  const ch = interaction.channel;
+  const meta = topicMetaToObj(ch.topic);
+  if (!meta.user) return interaction.reply({ content: 'Not a ticket.', ephemeral: true });
+  await ch.setTopic(makeTopic(meta.user, interaction.user.id));
+  await interaction.reply({ content: '✅ Ticket claimed', ephemeral: true });
+  await ch.send(`Hello <@${meta.user}>, I am ${interaction.user} from the **Phantom Forge** support team.`);
 }
 
+// === ADD ===
 async function handleAdd(interaction) {
-  const channel = interaction.channel;
-  const guild = interaction.guild;
-  if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
-
-  const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
-
   const user = interaction.options.getUser('user', true);
-
-  const isOwner = String(interaction.user.id) === meta.user;
-  const isSupport =
-    interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
-    (DEFAULT_SUPPORT_ROLE_ID && interaction.member.roles.cache.has(DEFAULT_SUPPORT_ROLE_ID.toString()));
-  const isAdmin =
-    interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
-    interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
-
-  if (!(isOwner || isSupport || isAdmin))
-    return interaction.reply({ content: 'You are not allowed to add people to this ticket.', ephemeral: true });
-
-  await channel.permissionOverwrites.edit(user.id, {
-    ViewChannel: true, SendMessages: true, ReadMessageHistory: true, AttachFiles: true
+  await interaction.channel.permissionOverwrites.edit(user.id, {
+    ViewChannel: true, SendMessages: true, ReadMessageHistory: true
   });
-
-  await interaction.reply({ content: `${user} has been added to the ticket ✅`, ephemeral: true });
+  await interaction.reply({ content: `${user} added ✅`, ephemeral: true });
 }
 
-// === HTML TRANSCRIPT BUILDER ===
+// === CLOSE / TRANSCRIPT ===
+async function handleClose(interaction) {
+  const channel = interaction.channel;
+  const meta = topicMetaToObj(channel.topic);
+  if (!meta.user) return interaction.reply({ content: 'Not a ticket.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+
+  const messages = await channel.messages.fetch({ limit: 100 });
+  const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  const renderMsgs = sorted.map(m => ({
+    authorName: m.author?.tag ?? 'Unknown',
+    authorAvatar: m.author?.displayAvatarURL({ extension: 'webp', size: 128 }) ?? '',
+    timestamp: formatDate(m.createdTimestamp),
+    content: m.content ?? '',
+    attachments: [...m.attachments.values()].map(a => ({ url: a.url, name: a.name })),
+    embed: m.embeds[0]
+      ? {
+          title: m.embeds[0].title ?? '',
+          description: m.embeds[0].description ?? '',
+          footer: m.embeds[0].footer?.text ?? '',
+          colorHex: toHexColor(m.embeds[0].color)
+        }
+      : null
+  }));
+
+  const html = buildTranscriptHTML({
+    channelName: channel.name,
+    closedByTag: interaction.user.tag,
+    closedAt: formatDate(Date.now()),
+    messages: renderMsgs
+  });
+  const buffer = Buffer.from(html, 'utf-8');
+
+  try {
+    const user = await client.users.fetch(meta.user);
+    await user.send({
+      content: `🗂️ Transcript for your ticket **#${channel.name}**`,
+      files: [{ attachment: buffer, name: `${channel.name}-transcript.html` }]
+    });
+    await interaction.editReply('Transcript sent ✅ Closing in 5s');
+  } catch {
+    await interaction.editReply('Could not DM transcript, closing anyway.');
+  }
+
+  setTimeout(() => channel.delete('Ticket closed.'), 5000);
+}
+
+// === BUILD TRANSCRIPT HTML ===
 function buildTranscriptHTML({ channelName, closedByTag, closedAt, messages }) {
+  const LOGO_URL = 'https://i.postimg.cc/HkfVrFF8/Schermafbeelding-2025-10-16-170745-removebg-preview.png';
   const header = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1.0" />
-<title>Discord Ticket Transcript - ${escapeHtml(channelName)}</title>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>${escapeHtml(channelName)}</title>
 <style>
-:root {
-  --background-primary: #36393f;
-  --background-secondary: #2f3136;
-  --background-tertiary: #202225;
-  --text-normal: #dcddde;
-  --text-muted: #72767d;
-  --text-link: #00b0f4;
-  --header-primary: #fff;
-  --interactive-hover: #dcddde;
-  --background-modifier-accent: hsla(0,0%,100%,0.06);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background-color:var(--background-primary);color:var(--text-normal);font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;line-height:1.5}
+:root{--accent:#8000ff;--bg:#0f001f;--text:#e9dcff;--muted:#b7a8d9}
+body{background:url('https://i.postimg.cc/zvsvYJGs/Schermafbeelding-2025-10-05-022559.png') center/cover fixed;
+color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.5;margin:0}
 .container{max-width:1200px;margin:0 auto;padding:20px}
-.header{background-color:var(--background-secondary);padding:20px;border-radius:5px 5px 0 0;margin-bottom:20px;box-shadow:0 1px 0 rgba(4,4,5,.2)}
-.header h1{color:var(--header-primary);font-size:24px;margin-bottom:10px}
-.header-info{display:flex;flex-wrap:wrap;gap:15px;font-size:14px;color:var(--text-muted)}
-.header-info strong{color:var(--interactive-hover);margin-right:6px}
-.messages-container{background-color:var(--background-primary);border-radius:0 0 5px 5px;padding:0 10px;box-shadow:0 1px 0 rgba(4,4,5,.2)}
-.message{padding:15px 10px;border-top:1px solid var(--background-modifier-accent)}
+.header{background:rgba(25,0,53,0.8);padding:20px;border-radius:10px 10px 0 0;box-shadow:0 0 15px rgba(128,0,255,.4);border:1px solid var(--accent);margin-bottom:20px}
+.header-top{display:flex;align-items:center;gap:14px;margin-bottom:10px}
+.logo{width:56px;height:56px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(128,0,255,.6))}
+h1{color:#fff;margin:0;text-shadow:0 0 10px var(--accent);font-size:24px}
+.header-info{display:flex;flex-wrap:wrap;gap:15px;font-size:14px;color:var(--muted)}
+.header-info strong{color:var(--accent)}
+.messages-container{background:rgba(20,0,40,.7);border-radius:0 0 10px 10px;padding:0 10px;box-shadow:0 0 15px rgba(128,0,255,.3);border:1px solid rgba(128,0,255,.4)}
+.message{padding:15px 10px;border-top:1px solid rgba(128,0,255,.3)}
 .message:first-child{border-top:none}
 .message-header{display:flex;align-items:center;margin-bottom:6px}
-.avatar{width:40px;height:40px;border-radius:50%;margin-right:10px}
-.user-info{display:flex;flex-direction:column}
-.username{color:var(--header-primary);font-weight:600;font-size:16px}
-.timestamp{color:var(--text-muted);font-size:12px;margin-top:2px}
-.message-content{color:var(--text-normal);font-size:15px;line-height:1.4;white-space:pre-wrap;margin-left:50px}
-.attachment{margin-top:8px;margin-left:50px;padding:8px;background-color:var(--background-secondary);border-radius:3px;display:inline-block}
-.attachment a{color:var(--text-link);text-decoration:none}
-.embed{margin-top:8px;margin-left:50px;padding:8px 12px;background-color:var(--background-secondary);border-radius:4px;max-width:520px;border-left:4px solid #5865f2}
-.embed-title{color:var(--header-primary);font-weight:600;font-size:16px;margin-bottom:6px}
-.embed-description{color:var(--text-normal);font-size:14px;margin-bottom:6px}
-.embed-footer{color:var(--text-muted);font-size:12px;margin-top:6px}
-@media (max-width:768px){.container{padding:10px}.header{padding:15px}}
-</style>
-</head>
-<body>
-<div class="container">
+.avatar{width:40px;height:40px;border-radius:50%;margin-right:10px;box-shadow:0 0 10px rgba(128,0,255,.5)}
+.username{font-weight:600;font-size:16px;text-shadow:0 0 8px rgba(128,0,255,.5);color:#fff}
+.timestamp{color:var(--muted);font-size:12px}
+.message-content{margin-left:50px;font-size:15px;white-space:pre-wrap}
+.attachment{margin-left:50px;margin-top:8px;display:inline-block;background:rgba(40,0,80,.6);border:1px solid rgba(128,0,255,.4);border-radius:5px;padding:8px}
+.attachment a{color:#cdb5ff;text-decoration:none}
+.embed{margin-left:50px;margin-top:8px;padding:8px 12px;background:rgba(30,0,60,.6);border-left:4px solid var(--accent);border-radius:6px;box-shadow:0 0 10px rgba(128,0,255,.3)}
+.embed-title{color:#fff;font-weight:600;margin-bottom:6px}
+.embed-description{color:#e9dcff;margin-bottom:6px}
+.embed-footer{color:#b7a8d9;font-size:12px;margin-top:6px}
+.footer-watermark{text-align:center;color:#c8aaff;margin-top:25px;font-size:13px;text-shadow:0 0 6px rgba(128,0,255,.6)}
+.footer-watermark a{color:#c8aaff;text-decoration:none;font-weight:600}
+.footer-watermark a:hover{color:#fff;text-shadow:0 0 10px var(--accent)}
+</style></head><body><div class="container">
   <div class="header">
-    <h1>Ticket Transcript - ${escapeHtml(channelName)}</h1>
+    <div class="header-top">
+      <img class="logo" src="${escapeHtml(LOGO_URL)}" alt="Phantom Forge logo" onerror="this.style.display='none'">
+      <h1>Ticket Transcript - ${escapeHtml(channelName)}</h1>
+    </div>
     <div class="header-info">
       <div><strong>Channel:</strong> ${escapeHtml(channelName)}</div>
       <div><strong>Closed by:</strong> ${escapeHtml(closedByTag)}</div>
@@ -406,15 +387,15 @@ body{background-color:var(--background-primary);color:var(--text-normal);font-fa
     const embed = m.embed;
     let embedHtml = '';
     if (embed) {
-      const border = embed.colorHex || '#5865f2';
+      const border = embed.colorHex || '#8000ff';
       const title = escapeHtml(embed.title || '');
       const desc = escapeHtml(embed.description || '');
       const footer = escapeHtml(embed.footer || '');
-      embedHtml = `<div class="embed" style="border-left: 4px solid ${border}">` +
-                  (title ? `<div class="embed-title">${title}</div>` : '') +
-                  (desc ? `<div class="embed-description">${desc}</div>` : '') +
-                  (footer ? `<div class="embed-footer">${footer}</div>` : '') +
-                  `</div>`;
+      embedHtml = `<div class="embed" style="border-left: 4px solid ${border}">
+        ${title ? `<div class="embed-title">${title}</div>` : ''}
+        ${desc ? `<div class="embed-description">${desc}</div>` : ''}
+        ${footer ? `<div class="embed-footer">${footer}</div>` : ''}
+      </div>`;
     }
 
     return `
@@ -434,82 +415,14 @@ body{background-color:var(--background-primary);color:var(--text-normal);font-fa
 
   const footer = `
   </div>
-</div>
-</body>
-</html>`;
+  <div class="footer-watermark">
+    ──────────────────────────────<br>
+    Generated by <a href="https://discord.gg/phantomforge" target="_blank">Phantom Forge Ticket Bot</a><br>
+    <span style="font-size:11px;opacity:0.8;">© 2025 Phantom Forge</span>
+  </div>
+</div></body></html>`;
 
   return header + items + footer;
-}
-
-// === /close: HTML transcript + DM ===
-async function handleClose(interaction) {
-  const channel = interaction.channel;
-  const guild = interaction.guild;
-  if (!guild || channel?.type !== ChannelType.GuildText)
-    return interaction.reply({ content: 'Use this inside a ticket channel.', ephemeral: true });
-
-  const meta = topicMetaToObj(channel.topic);
-  if (!meta.user) return interaction.reply({ content: 'This channel is not a ticket.', ephemeral: true });
-
-  await interaction.deferReply({ ephemeral: true });
-
-  // Fetch last 100 messages ascending
-  const messages = await channel.messages.fetch({ limit: 100 });
-  const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-  // Map to renderable objects
-  const renderMsgs = sorted.map(m => {
-    const author = m.author;
-    const authorName = author?.tag ?? author?.username ?? 'Unknown';
-    const authorAvatar = author?.displayAvatarURL?.({ extension: 'webp', size: 128 }) ?? '';
-    const timestamp = formatDate(m.createdTimestamp);
-    const content = m.content ?? '';
-
-    // Attachments
-    const attachments = m.attachments?.size
-      ? [...m.attachments.values()].map(a => ({ url: a.url, name: a.name }))
-      : [];
-
-    // Basic single-embed render (title/description/footer/color)
-    let embedObj = null;
-    const e = m.embeds?.[0];
-    if (e) {
-      const colorHex = toHexColor(e.color);
-      embedObj = {
-        title: e.title ?? '',
-        description: e.description ?? '',
-        footer: e.footer?.text ?? '',
-        colorHex
-      };
-    }
-
-    return { authorName, authorAvatar, timestamp, content, attachments, embed: embedObj };
-  });
-
-  // Build HTML
-  const html = buildTranscriptHTML({
-    channelName: channel.name,
-    closedByTag: interaction.user?.tag ?? interaction.user?.username ?? 'Unknown',
-    closedAt: formatDate(Date.now()),
-    messages: renderMsgs
-  });
-  const buffer = Buffer.from(html, 'utf-8');
-
-  // DM to ticket opener
-  let dmOk = false;
-  try {
-    const user = await client.users.fetch(meta.user);
-    await user.send({
-      content: `🗂️ Here is the transcript for your ticket **#${channel.name}**.`,
-      files: [{ attachment: buffer, name: `${channel.name}-transcript.html` }]
-    });
-    dmOk = true;
-  } catch { dmOk = false; }
-
-  if (dmOk) await interaction.editReply({ content: 'Transcript sent via DM ✅ Closing channel…' });
-  else await interaction.editReply({ content: 'Could not DM the transcript. Closing channel anyway.' });
-
-  setTimeout(async () => { try { await channel.delete('Ticket closed.'); } catch {} }, 4000);
 }
 
 // === HTTP SERVER FOR RENDER ===
@@ -531,9 +444,13 @@ const externalBase =
   process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const KEEPALIVE_URL = `${externalBase.replace(/\/$/, '')}/health`;
 setInterval(() => {
-  try { http.get(KEEPALIVE_URL, res => { res.on('data', () => {}); res.on('end', () => {}); }).on('error', () => {}); }
-  catch {}
-}, 4 * 60 * 1000); // every 4 min
+  try {
+    http.get(KEEPALIVE_URL, res => {
+      res.on('data', () => {});
+      res.on('end', () => {});
+    }).on('error', () => {});
+  } catch {}
+}, 4 * 60 * 1000);
 
 // === LOGIN ===
 client.login(TOKEN);
