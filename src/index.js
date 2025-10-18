@@ -25,7 +25,7 @@ const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
 const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || '';
 const MAX_TRANSCRIPT_MESSAGES = Number(process.env.MAX_TRANSCRIPT_MESSAGES || 1000); // >100 supported
-const TRANSCRIPT_TTL_MS = Number(process.env.TRANSCRIPT_TTL_MS || 7 * 24 * 60 * 60 * 1000); // 7d
+const TRANSCRIPT_TTL_MS = Number(process.env.TRANSCRIPT_TTL_MS || 7 * 24 * 60 * 60 * 1000); // 7 days
 
 if (!TOKEN) {
   console.error('❌ Please set DISCORD_TOKEN in your environment variables');
@@ -44,7 +44,7 @@ function putTranscript(html, filename) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of transcripts) if (now - v.ts > TRANSCRIPT_TTL_MS) transcripts.delete(k);
-}, 60 * 60 * 1000);
+}, 60 * 60 * 1000); // hourly GC
 
 // === DISCORD CLIENT ===
 const client = new Client({
@@ -58,6 +58,7 @@ const client = new Client({
 });
 
 const creatingTicketFor = new Set();
+let lastStatusMessage = null; // status-embed bericht-id
 
 // === HELPERS ===
 function topicMetaToObj(topic) {
@@ -169,7 +170,7 @@ async function registerCommands() {
   } catch (e) { console.error('Command sync error:', e); }
 }
 
-// === READY ===
+// === PRESENCE ===
 function computePresenceGuildName() {
   const preferred = GUILD_ID ? client.guilds.cache.get(GUILD_ID) : null;
   const g = preferred || client.guilds.cache.first();
@@ -180,26 +181,53 @@ async function setWatchingPresence() {
   client.user.setPresence({ status: 'online', activities: [{ name, type: ActivityType.Watching }] });
 }
 
+// === READY ===
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await setWatchingPresence();
   await registerCommands();
+
+  // Start status loop: 1 Hz live updates
   postStatus().catch(() => {});
-  setInterval(() => postStatus().catch(() => {}), 10 * 60 * 1000);
+  setInterval(() => postStatus().catch(() => {}), 1000);
 });
 
-// Update presence when bot joins/leaves servers
+// Update presence when joining/leaving servers
 client.on('guildCreate', () => setWatchingPresence().catch(() => {}));
 client.on('guildDelete', () => setWatchingPresence().catch(() => {}));
 
+// === LIVE STATUS EMBED (every second, with ping) ===
 async function postStatus() {
   if (!STATUS_CHANNEL_ID) return;
   const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
+
   const active = client.isReady();
   const uptimeStr = formatUptime(client.uptime ?? 0);
-  const content = `Phantom Forge Ticket Bot\nactive: ${active ? 'true' : 'false'}\nuptime: ${uptimeStr}`;
-  await ch.send({ content }).catch(() => {});
+  const now = new Date().toLocaleString('en-US');
+  const pingMs = Math.max(0, Math.round(client.ws.ping)); // WebSocket ping
+
+  const embed = new EmbedBuilder()
+    .setColor(active ? '#00ff88' : '#ff0055')
+    .setTitle('🕒 Phantom Forge Ticket Bot Status')
+    .setDescription([
+      `**Active:** ${active ? '✅ Online' : '❌ Offline'}`,
+      `**Uptime:** \`${uptimeStr}\``,
+      `**Ping:** \`${pingMs} ms\``,
+      `**Last update:** ${now}`
+    ].join('\n'))
+    .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() });
+
+  try {
+    if (lastStatusMessage) {
+      const msg = await ch.messages.fetch(lastStatusMessage).catch(() => null);
+      if (msg) { await msg.edit({ embeds: [embed] }); return; }
+    }
+    const newMsg = await ch.send({ embeds: [embed] });
+    lastStatusMessage = newMsg.id;
+  } catch (e) {
+    console.error('Error updating status embed:', e);
+  }
 }
 
 // === INTERACTIONS ===
@@ -224,14 +252,15 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// === /uptime ===
+// === /uptime (ephemeral) ===
 async function handleUptime(interaction) {
   const active = client.isReady();
   const uptimeStr = formatUptime(client.uptime ?? 0);
+  const pingMs = Math.max(0, Math.round(client.ws.ping));
   const embed = new EmbedBuilder()
     .setColor('#8000ff')
     .setTitle('Phantom Forge Ticket Bot')
-    .setDescription(`**Active:** ${active ? '✅ true' : '❌ false'}\n**Uptime:** ${uptimeStr}`);
+    .setDescription(`**Active:** ${active ? '✅ true' : '❌ false'}\n**Uptime:** \`${uptimeStr}\`\n**Ping:** \`${pingMs} ms\``);
   await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
@@ -350,7 +379,7 @@ async function fetchAllMessages(channel, maxCount) {
     if (!batch || batch.size === 0) break;
     const arr = [...batch.values()];
     collected.push(...arr);
-    beforeId = arr[arr.length - 1].id;
+    beforeId = arr[arr.length - 1].id; // next page before the oldest
     if (batch.size < 100) break;
   }
   return collected;
@@ -369,7 +398,7 @@ async function handleClose(interaction) {
 
   const renderMsgs = sorted.map(m => {
     const raw = m.content ?? '';
-    const content = resolveMentionsInContent(raw, m); // <-- mentions naar leesbare labels
+    const content = resolveMentionsInContent(raw, m);
     return {
       authorName: m.author?.tag ?? 'Unknown',
       authorAvatar: m.author?.displayAvatarURL({ extension: 'webp', size: 128 }) ?? '',
