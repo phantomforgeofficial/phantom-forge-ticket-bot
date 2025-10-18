@@ -15,16 +15,18 @@ import {
   Routes
 } from 'discord.js';
 
+// === ENVIRONMENT VARS ===
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
 
 if (!TOKEN) {
-  console.error('❌ Please set DISCORD_TOKEN in your .env');
+  console.error('❌ Please set DISCORD_TOKEN in your environment variables');
   process.exit(1);
 }
 
+// === DISCORD CLIENT ===
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -35,29 +37,32 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ===== Locks to prevent duplicates =====
-const creatingTicketFor = new Set();     // per user
-const processingInteraction = new Set(); // per interaction
+// Prevent spam/duplicates
+const creatingTicketFor = new Set();
+const processingInteraction = new Set();
 
-// ================= Helpers =================
+// === HELPERS ===
 function topicMetaToObj(topic) {
   const meta = { user: null, claimed_by: null };
   if (!topic) return meta;
   try {
     for (const kv of topic.split(';')) {
       const [k, v] = kv.split(':');
-      if (k === 'ticket_user') meta.user = v && v !== 'None' ? v : null;
-      if (k === 'claimed_by') meta.claimed_by = v && v !== 'None' ? v : null;
+      if (k === 'ticket_user') meta.user = v || null;
+      if (k === 'claimed_by') meta.claimed_by = v || null;
     }
   } catch {}
   return meta;
 }
+
 function makeTopic(userId, claimedBy) {
   return `ticket_user:${userId};claimed_by:${claimedBy ?? ''}`;
 }
+
 function panelFooterText(supportRoleId, categoryId) {
   return `support_role:${supportRoleId || ''};category:${categoryId || ''}`;
 }
+
 function parseFooter(embed) {
   const out = { supportRoleId: null, categoryId: null };
   const text = embed?.footer?.text ?? '';
@@ -71,6 +76,7 @@ function parseFooter(embed) {
   } catch {}
   return out;
 }
+
 async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   const targetFooter = panelFooterText(supportRoleId, categoryId);
   const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
@@ -83,7 +89,7 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   return null;
 }
 
-// ================ Slash Commands ================
+// === SLASH COMMANDS ===
 const commands = [
   {
     name: 'panel',
@@ -104,6 +110,7 @@ const commands = [
   { name: 'close', description: 'Close this ticket' }
 ];
 
+// === REGISTER COMMANDS ===
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
@@ -120,13 +127,17 @@ async function registerCommands() {
   }
 }
 
-// ================== Ready ==================
+// === READY ===
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  client.user.setPresence({
+    status: 'online',
+    activities: [{ name: 'Phantom Forge Tickets', type: 0 }]
+  });
   await registerCommands();
 });
 
-// ============ Interaction handling ============
+// === INTERACTION HANDLER ===
 client.on('interactionCreate', async (interaction) => {
   try {
     const key = `${interaction.id}`;
@@ -154,7 +165,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ================= Commands =================
+// === COMMAND IMPLEMENTATIONS ===
 async function handlePanel(interaction) {
   if (
     !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
@@ -289,9 +300,7 @@ async function handleClaim(interaction) {
   await channel.setTopic(makeTopic(meta.user, interaction.user.id));
   await interaction.reply({ content: 'Ticket claimed ✅', ephemeral: true });
 
-  await channel.send(
-    `Hello <@${meta.user}> — I am ${interaction.user} from the **Phantom Forge** support team. Happy to help!`
-  );
+  await channel.send(`Hello <@${meta.user}> — I am ${interaction.user} from the **Phantom Forge** support team. Happy to help!`);
 }
 
 async function handleAdd(interaction) {
@@ -337,7 +346,7 @@ async function handleClose(interaction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Build transcript (last 100 messages)
+  // Transcript
   const messages = await channel.messages.fetch({ limit: 100 });
   const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
   let txt = `Transcript of #${channel.name}\n\n`;
@@ -349,7 +358,7 @@ async function handleClose(interaction) {
   }
   const buffer = Buffer.from(txt, 'utf-8');
 
-  // DM transcript to ticket opener
+  // DM transcript
   let dmOk = false;
   try {
     const user = await client.users.fetch(meta.user);
@@ -362,35 +371,38 @@ async function handleClose(interaction) {
     dmOk = false;
   }
 
-  if (dmOk) {
-    await interaction.editReply({ content: 'Transcript sent via DM ✅ Closing channel…' });
-  } else {
-    await interaction.editReply({
-      content: 'Could not DM the transcript (user has DMs off). Closing channel anyway.'
-    });
-  }
+  if (dmOk) await interaction.editReply({ content: 'Transcript sent via DM ✅ Closing channel…' });
+  else await interaction.editReply({ content: 'Could not DM the transcript. Closing channel anyway.' });
 
   setTimeout(async () => {
     try { await channel.delete('Ticket closed.'); } catch {}
   }, 4000);
 }
 
-// --------------- Tiny HTTP server for Render Free Web Service ---------------
+// === HTTP SERVER FOR RENDER (keeps port open) ===
 const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    // simple health endpoint
-    if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Phantom Forge Ticket Bot is running.\n');
-  })
-  .listen(PORT, () => {
-    console.log(`🌐 HTTP server listening on port ${PORT} (required for Render free web service)`);
-  });
+http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Phantom Forge Ticket Bot is running.\n');
+}).listen(PORT, () => {
+  console.log(`🌐 HTTP server listening on port ${PORT} (Render free web service)`);
+});
 
-// --------------- Login ---------------
+// === KEEP-ALIVE SELF-PING ===
+const KEEPALIVE_URL = process.env.KEEPALIVE_URL || `http://localhost:${PORT}/health`;
+setInterval(() => {
+  try {
+    http.get(KEEPALIVE_URL, res => {
+      res.on('data', () => {});
+      res.on('end', () => {});
+    }).on('error', () => {});
+  } catch {}
+}, 4 * 60 * 1000); // every 4 min
+
+// === LOGIN ===
 client.login(TOKEN);
