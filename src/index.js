@@ -20,9 +20,8 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
-
-// Status-log kanaal (vast ID uit jouw vraag)
-const STATUS_CHANNEL_ID = '1429121620194234478';
+// status kanaal via env (string laten)
+const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || ''; // e.g. "1429121620194234478"
 
 if (!TOKEN) {
   console.error('❌ Please set DISCORD_TOKEN in your environment variables');
@@ -40,7 +39,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// Prevent spam/duplicates
+// Prevent duplicates
 const creatingTicketFor = new Set();
 const processingInteraction = new Set();
 
@@ -57,15 +56,8 @@ function topicMetaToObj(topic) {
   } catch {}
   return meta;
 }
-
-function makeTopic(userId, claimedBy) {
-  return `ticket_user:${userId};claimed_by:${claimedBy ?? ''}`;
-}
-
-function panelFooterText(supportRoleId, categoryId) {
-  return `support_role:${supportRoleId || ''};category:${categoryId || ''}`;
-}
-
+function makeTopic(userId, claimedBy) { return `ticket_user:${userId};claimed_by:${claimedBy ?? ''}`; }
+function panelFooterText(supportRoleId, categoryId) { return `support_role:${supportRoleId || ''};category:${categoryId || ''}`; }
 function parseFooter(embed) {
   const out = { supportRoleId: null, categoryId: null };
   const text = embed?.footer?.text ?? '';
@@ -79,7 +71,6 @@ function parseFooter(embed) {
   } catch {}
   return out;
 }
-
 async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   const targetFooter = panelFooterText(supportRoleId, categoryId);
   const msgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
@@ -91,7 +82,6 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   }
   return null;
 }
-
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
   const hh = String(Math.floor(s / 3600)).padStart(2, '0');
@@ -121,56 +111,38 @@ const commands = [
   { name: 'close', description: 'Close this ticket' }
 ];
 
-// === REGISTER COMMANDS ===
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
     const app = await client.application?.fetch();
-    if (GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
-      console.log('✅ Synced guild commands');
-    } else {
-      await rest.put(Routes.applicationCommands(app.id), { body: commands });
-      console.log('✅ Synced global commands');
-    }
-  } catch (e) {
-    console.error('Command sync error:', e);
-  }
+    if (GUILD_ID) await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
+    else await rest.put(Routes.applicationCommands(app.id), { body: commands });
+    console.log('✅ Slash commands synced');
+  } catch (e) { console.error('Command sync error:', e); }
 }
 
 // === READY ===
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  client.user.setPresence({
-    status: 'online',
-    activities: [{ name: 'Phantom Forge Tickets', type: 0 }]
-  });
+  client.user.setPresence({ status: 'online', activities: [{ name: 'Phantom Forge Tickets', type: 0 }] });
   await registerCommands();
 
-  // Start status-loop: meteen 1x posten en daarna elke 10 min
+  // Status-loop: direct + elke 10 min
   postStatus().catch(() => {});
   setInterval(() => postStatus().catch(() => {}), 10 * 60 * 1000);
 });
 
-// Post status in vast kanaal
 async function postStatus() {
+  if (!STATUS_CHANNEL_ID) return; // niets ingesteld
   const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
-
   const active = client.isReady();
-  const uptimeMs = client.uptime ?? 0;
-  const uptimeStr = formatUptime(uptimeMs);
-
-  const content = [
-    'Phantom Forge Ticket Bot',
-    `active: ${active ? 'true' : 'false'}`,
-    `uptime: ${uptimeStr}`
-  ].join('\n');
-
+  const uptimeStr = formatUptime(client.uptime ?? 0);
+  const content = ['Phantom Forge Ticket Bot', `active: ${active ? 'true' : 'false'}`, `uptime: ${uptimeStr}`].join('\n');
   await ch.send({ content }).catch(() => {});
 }
 
-// === INTERACTION HANDLER ===
+// === INTERACTIONS ===
 client.on('interactionCreate', async (interaction) => {
   try {
     const key = `${interaction.id}`;
@@ -193,20 +165,15 @@ client.on('interactionCreate', async (interaction) => {
     const msg = { content: 'Something went wrong.', ephemeral: true };
     if (interaction.deferred || interaction.replied) await interaction.followUp(msg).catch(() => {});
     else await interaction.reply(msg).catch(() => {});
-  } finally {
-    processingInteraction.delete(`${interaction.id}`);
-  }
+  } finally { processingInteraction.delete(`${interaction.id}`); }
 });
 
-// === COMMAND IMPLEMENTATIONS ===
+// === COMMAND IMPLEMENTATION ===
 async function handlePanel(interaction) {
-  if (
-    !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
-    !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)
-  ) {
+  if (!interaction.memberPermissions.has(PermissionsBitField.Flags.ManageGuild) &&
+      !interaction.memberPermissions.has(PermissionsBitField.Flags.ManageChannels)) {
     return interaction.reply({ content: 'You need Manage Server/Channels to use this.', ephemeral: true });
   }
-
   await interaction.deferReply({ ephemeral: true });
 
   const supportRole = interaction.options.getRole('support_role');
@@ -218,9 +185,7 @@ async function handlePanel(interaction) {
   const categoryId = category?.id ? BigInt(category.id) : DEFAULT_CATEGORY_ID;
 
   const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description)
-    .setColor('#8000ff')
+    .setTitle(title).setDescription(description).setColor('#8000ff')
     .setFooter({ text: panelFooterText(supportRoleId, categoryId) });
 
   const row = new ActionRowBuilder().addComponents(
@@ -244,9 +209,7 @@ async function handleOpenTicket(interaction) {
   await interaction.deferReply({ ephemeral: true });
   const userId = interaction.user.id;
 
-  if (creatingTicketFor.has(userId)) {
-    return interaction.editReply({ content: 'Your ticket is already being created… ⏳' });
-  }
+  if (creatingTicketFor.has(userId)) return interaction.editReply({ content: 'Your ticket is already being created… ⏳' });
   creatingTicketFor.add(userId);
 
   try {
@@ -269,12 +232,7 @@ async function handleOpenTicket(interaction) {
     if (supportRoleId) {
       overwrites.push({
         id: supportRoleId.toString(),
-        allow: [
-          PermissionsBitField.Flags.ViewChannel,
-          PermissionsBitField.Flags.SendMessages,
-          PermissionsBitField.Flags.ReadMessageHistory,
-          PermissionsBitField.Flags.AttachFiles
-        ],
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles],
         type: OverwriteType.Role
       });
     }
@@ -305,20 +263,14 @@ async function handleOpenTicket(interaction) {
 
     await channel.send({
       content: contentParts.join(' '),
-      allowedMentions: {
-        parse: [],
-        users: [userId],
-        roles: supportRoleId ? [supportRoleId.toString()] : []
-      },
+      allowedMentions: { parse: [], users: [userId], roles: supportRoleId ? [supportRoleId.toString()] : [] },
       embeds: [welcomeEmbed],
       components: [ticketButtons]
     });
   } catch (err) {
     console.error('Open ticket error:', err);
     try { await interaction.editReply({ content: 'Something went wrong creating your ticket.' }); } catch {}
-  } finally {
-    creatingTicketFor.delete(userId);
-  }
+  } finally { creatingTicketFor.delete(userId); }
 }
 
 async function handleClaim(interaction) {
@@ -332,7 +284,6 @@ async function handleClaim(interaction) {
 
   await channel.setTopic(makeTopic(meta.user, interaction.user.id));
   await interaction.reply({ content: 'Ticket claimed ✅', ephemeral: true });
-
   await channel.send(`Hello <@${meta.user}> — I am ${interaction.user} from the **Phantom Forge** support team. Happy to help!`);
 }
 
@@ -359,10 +310,7 @@ async function handleAdd(interaction) {
     return interaction.reply({ content: 'You are not allowed to add people to this ticket.', ephemeral: true });
 
   await channel.permissionOverwrites.edit(user.id, {
-    ViewChannel: true,
-    SendMessages: true,
-    ReadMessageHistory: true,
-    AttachFiles: true
+    ViewChannel: true, SendMessages: true, ReadMessageHistory: true, AttachFiles: true
   });
 
   await interaction.reply({ content: `${user} has been added to the ticket ✅`, ephemeral: true });
@@ -379,14 +327,12 @@ async function handleClose(interaction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Transcript
+  // Transcript (last 100 msgs)
   const messages = await channel.messages.fetch({ limit: 100 });
   const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
   let txt = `Transcript of #${channel.name}\n\n`;
   for (const m of sorted) {
-    const atts = m.attachments?.size
-      ? ' ' + [...m.attachments.values()].map(a => `[attachment:${a.name}]`).join(' ')
-      : '';
+    const atts = m.attachments?.size ? ' ' + [...m.attachments.values()].map(a => `[attachment:${a.name}]`).join(' ') : '';
     txt += `[${new Date(m.createdTimestamp).toISOString()}] ${m.author.tag}: ${m.content || ''}${atts}\n`;
   }
   const buffer = Buffer.from(txt, 'utf-8');
@@ -400,19 +346,15 @@ async function handleClose(interaction) {
       files: [{ attachment: buffer, name: `${channel.name}-transcript.txt` }]
     });
     dmOk = true;
-  } catch {
-    dmOk = false;
-  }
+  } catch { dmOk = false; }
 
   if (dmOk) await interaction.editReply({ content: 'Transcript sent via DM ✅ Closing channel…' });
   else await interaction.editReply({ content: 'Could not DM the transcript. Closing channel anyway.' });
 
-  setTimeout(async () => {
-    try { await channel.delete('Ticket closed.'); } catch {}
-  }, 4000);
+  setTimeout(async () => { try { await channel.delete('Ticket closed.'); } catch {} }, 4000);
 }
 
-// === HTTP SERVER FOR RENDER (keeps port open) ===
+// === HTTP SERVER FOR RENDER ===
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   if (req.url === '/health') {
@@ -427,14 +369,12 @@ http.createServer((req, res) => {
 });
 
 // === KEEP-ALIVE SELF-PING ===
-const KEEPALIVE_URL = process.env.KEEPALIVE_URL || `http://localhost:${PORT}/health`;
+const externalBase =
+  process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const KEEPALIVE_URL = `${externalBase.replace(/\/$/, '')}/health`;
 setInterval(() => {
-  try {
-    http.get(KEEPALIVE_URL, res => {
-      res.on('data', () => {});
-      res.on('end', () => {});
-    }).on('error', () => {});
-  } catch {}
+  try { http.get(KEEPALIVE_URL, res => { res.on('data', () => {}); res.on('end', () => {}); }).on('error', () => {}); }
+  catch {}
 }, 4 * 60 * 1000); // every 4 min
 
 // === LOGIN ===
