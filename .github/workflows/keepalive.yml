@@ -2,7 +2,7 @@ name: Keep Render Awake
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # elke 5 minuten
+    - cron: "*/2 * * * *"   # elke 5 minuten
   workflow_dispatch:        # handmatig starten kan ook
 
 jobs:
