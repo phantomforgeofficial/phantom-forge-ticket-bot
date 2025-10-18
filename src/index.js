@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
+import url from 'node:url';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -21,11 +23,32 @@ const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
 const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID || ''; // e.g. "1429121620194234478"
+const MAX_TRANSCRIPT_MESSAGES = Number(process.env.MAX_TRANSCRIPT_MESSAGES || 1000); // >100 supported
+const TRANSCRIPT_TTL_MS = Number(process.env.TRANSCRIPT_TTL_MS || 7 * 24 * 60 * 60 * 1000); // 7d
 
 if (!TOKEN) {
   console.error('❌ Please set DISCORD_TOKEN in your environment variables');
   process.exit(1);
 }
+
+// === TRANSCRIPT STORE (in-memory, served via /t/:id) ===
+/** @type {Map<string, {html:string, filename:string, ts:number}>} */
+const transcripts = new Map();
+function makeId() {
+  return randomBytes(12).toString('hex'); // 24 chars
+}
+function putTranscript(html, filename) {
+  const id = makeId();
+  transcripts.set(id, { html, filename, ts: Date.now() });
+  return id;
+}
+function gcTranscripts() {
+  const now = Date.now();
+  for (const [k, v] of transcripts) {
+    if (now - v.ts > TRANSCRIPT_TTL_MS) transcripts.delete(k);
+  }
+}
+setInterval(gcTranscripts, 60 * 60 * 1000); // hourly GC
 
 // === DISCORD CLIENT ===
 const client = new Client({
@@ -279,15 +302,32 @@ async function handleAdd(interaction) {
   await interaction.reply({ content: `${user} added ✅`, ephemeral: true });
 }
 
-// === CLOSE / TRANSCRIPT ===
+// === FETCH MESSAGES (pagination) ===
+async function fetchAllMessages(channel, maxCount) {
+  const collected = [];
+  let beforeId = undefined;
+  while (collected.length < maxCount) {
+    const batch = await channel.messages.fetch({ limit: 100, before: beforeId }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    const arr = [...batch.values()];
+    collected.push(...arr);
+    beforeId = arr[arr.length - 1].id; // next page before the oldest
+    if (batch.size < 100) break;
+  }
+  return collected;
+}
+
+// === CLOSE / TRANSCRIPT (HTML + DM embed with link button) ===
 async function handleClose(interaction) {
   const channel = interaction.channel;
   const meta = topicMetaToObj(channel.topic);
   if (!meta.user) return interaction.reply({ content: 'Not a ticket.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
 
-  const messages = await channel.messages.fetch({ limit: 100 });
-  const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  // Fetch up to MAX_TRANSCRIPT_MESSAGES, oldest->newest
+  const fetched = await fetchAllMessages(channel, Math.max(101, MAX_TRANSCRIPT_MESSAGES));
+  const sorted = fetched.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
   const renderMsgs = sorted.map(m => ({
     authorName: m.author?.tag ?? 'Unknown',
     authorAvatar: m.author?.displayAvatarURL({ extension: 'webp', size: 128 }) ?? '',
@@ -310,37 +350,83 @@ async function handleClose(interaction) {
     closedAt: formatDate(Date.now()),
     messages: renderMsgs
   });
-  const buffer = Buffer.from(html, 'utf-8');
 
+  // Store transcript for download and create link
+  const filename = `${channel.name}-transcript.html`;
+  const id = putTranscript(html, filename);
+
+  // Build public URL (keepalive base or external)
+  const base =
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.KEEPALIVE_URL ||
+    `http://localhost:${process.env.PORT || 3000}`;
+  const downloadUrl = `${base.replace(/\/$/, '')}/t/${id}`;
+
+  // DM embed to ticket opener with link button
+  const guildName = interaction.guild?.name ?? 'our server';
+  const dmEmbed = new EmbedBuilder()
+    .setColor('#8000ff')
+    .setTitle(`Ticket Closed on ${guildName}`)
+    .setDescription([
+      `Your ticket on **${guildName}** has been closed.`,
+      ``,
+      `You can view the transcript here:`
+    ].join('\n'));
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setLabel('Download Transcript')
+      .setURL(downloadUrl)
+  );
+
+  let dmOk = false;
   try {
     const user = await client.users.fetch(meta.user);
-    await user.send({
-      content: `🗂️ Transcript for your ticket **#${channel.name}**`,
-      files: [{ attachment: buffer, name: `${channel.name}-transcript.html` }]
-    });
-    await interaction.editReply('Transcript sent ✅ Closing in 5s');
-  } catch {
-    await interaction.editReply('Could not DM transcript, closing anyway.');
-  }
+    await user.send({ embeds: [dmEmbed], components: [row] });
+    dmOk = true;
+  } catch { dmOk = false; }
+
+  if (dmOk) await interaction.editReply('Transcript link sent via DM ✅ Closing in 5s');
+  else await interaction.editReply(`Could not DM the transcript link. Here it is instead:\n${downloadUrl}`);
 
   setTimeout(() => channel.delete('Ticket closed.'), 5000);
 }
 
-// === BUILD TRANSCRIPT HTML ===
+// === BUILD TRANSCRIPT HTML (neon purple title + theme + logo) ===
 function buildTranscriptHTML({ channelName, closedByTag, closedAt, messages }) {
   const LOGO_URL = 'https://i.postimg.cc/HkfVrFF8/Schermafbeelding-2025-10-16-170745-removebg-preview.png';
   const header = `
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1.0" />
-<title>${escapeHtml(channelName)}</title>
+<title>Discord Ticket Transcript - ${escapeHtml(channelName)}</title>
 <style>
 :root{--accent:#8000ff;--bg:#0f001f;--text:#e9dcff;--muted:#b7a8d9}
-body{background:url('https://i.postimg.cc/zvsvYJGs/Schermafbeelding-2025-10-05-022559.png') center/cover fixed;
-color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.5;margin:0}
+body{
+  background:url('https://i.postimg.cc/zvsvYJGs/Schermafbeelding-2025-10-05-022559.png') center/cover fixed;
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  line-height:1.5;margin:0
+}
 .container{max-width:1200px;margin:0 auto;padding:20px}
-.header{background:rgba(25,0,53,0.8);padding:20px;border-radius:10px 10px 0 0;box-shadow:0 0 15px rgba(128,0,255,.4);border:1px solid var(--accent);margin-bottom:20px}
+.header{
+  background:rgba(25,0,53,0.8);
+  padding:20px;border-radius:10px 10px 0 0;
+  box-shadow:0 0 15px rgba(128,0,255,.4);
+  border:1px solid var(--accent);
+  margin-bottom:20px
+}
 .header-top{display:flex;align-items:center;gap:14px;margin-bottom:10px}
 .logo{width:56px;height:56px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(128,0,255,.6))}
-h1{color:#fff;margin:0;text-shadow:0 0 10px var(--accent);font-size:24px}
+h1{
+  margin:0;font-size:24px;color:#fff;
+  /* Neon paarse titel (met accent) */
+  color:#fff;
+  text-shadow:
+    0 0 2px #fff,
+    0 0 6px var(--accent),
+    0 0 12px var(--accent),
+    0 0 20px var(--accent);
+}
 .header-info{display:flex;flex-wrap:wrap;gap:15px;font-size:14px;color:var(--muted)}
 .header-info strong{color:var(--accent)}
 .messages-container{background:rgba(20,0,40,.7);border-radius:0 0 10px 10px;padding:0 10px;box-shadow:0 0 15px rgba(128,0,255,.3);border:1px solid rgba(128,0,255,.4)}
@@ -425,30 +511,53 @@ h1{color:#fff;margin:0;text-shadow:0 0 10px var(--accent);font-size:24px}
   return header + items + footer;
 }
 
-// === HTTP SERVER FOR RENDER ===
+// === HTTP SERVER FOR RENDER + TRANSCRIPT DOWNLOAD ===
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
-    return;
+const server = http.createServer((req, res) => {
+  try {
+    const parsed = url.parse(req.url, true);
+    if (parsed.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    // /t/:id -> download transcript as attachment
+    const match = /^\/t\/([a-f0-9]{24})$/i.exec(parsed.pathname || '');
+    if (match) {
+      const id = match[1];
+      const item = transcripts.get(id);
+      if (!item) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Transcript not found or expired.');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${item.filename.replace(/"/g, '')}"`
+      });
+      res.end(item.html);
+      return;
+    }
+
+    // default
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Phantom Forge Ticket Bot is running.\n');
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Internal error.');
   }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Phantom Forge Ticket Bot is running.\n');
-}).listen(PORT, () => {
+});
+server.listen(PORT, () => {
   console.log(`🌐 HTTP server listening on port ${PORT} (Render free web service)`);
 });
 
 // === KEEP-ALIVE SELF-PING ===
 const externalBase =
-  process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  process.env.RENDER_EXTERNAL_URL || process.env.KEEPALIVE_URL || `http://localhost:${PORT}`;
 const KEEPALIVE_URL = `${externalBase.replace(/\/$/, '')}/health`;
 setInterval(() => {
   try {
-    http.get(KEEPALIVE_URL, res => {
-      res.on('data', () => {});
-      res.on('end', () => {});
-    }).on('error', () => {});
+    http.get(KEEPALIVE_URL, res => { res.on('data', () => {}); res.on('end', () => {}); }).on('error', () => {});
   } catch {}
 }, 4 * 60 * 1000);
 
