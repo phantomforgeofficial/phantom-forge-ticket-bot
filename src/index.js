@@ -21,6 +21,9 @@ const GUILD_ID = process.env.GUILD_ID;
 const DEFAULT_SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID ? BigInt(process.env.SUPPORT_ROLE_ID) : null;
 const DEFAULT_CATEGORY_ID = process.env.TICKETS_CATEGORY_ID ? BigInt(process.env.TICKETS_CATEGORY_ID) : null;
 
+// Status-log kanaal (vast ID uit jouw vraag)
+const STATUS_CHANNEL_ID = '1429121620194234478';
+
 if (!TOKEN) {
   console.error('❌ Please set DISCORD_TOKEN in your environment variables');
   process.exit(1);
@@ -89,6 +92,14 @@ async function findExistingPanelMessage(channel, supportRoleId, categoryId) {
   return null;
 }
 
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
 // === SLASH COMMANDS ===
 const commands = [
   {
@@ -135,7 +146,29 @@ client.once('ready', async () => {
     activities: [{ name: 'Phantom Forge Tickets', type: 0 }]
   });
   await registerCommands();
+
+  // Start status-loop: meteen 1x posten en daarna elke 10 min
+  postStatus().catch(() => {});
+  setInterval(() => postStatus().catch(() => {}), 10 * 60 * 1000);
 });
+
+// Post status in vast kanaal
+async function postStatus() {
+  const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return;
+
+  const active = client.isReady();
+  const uptimeMs = client.uptime ?? 0;
+  const uptimeStr = formatUptime(uptimeMs);
+
+  const content = [
+    'Phantom Forge Ticket Bot',
+    `active: ${active ? 'true' : 'false'}`,
+    `uptime: ${uptimeStr}`
+  ].join('\n');
+
+  await ch.send({ content }).catch(() => {});
+}
 
 // === INTERACTION HANDLER ===
 client.on('interactionCreate', async (interaction) => {
