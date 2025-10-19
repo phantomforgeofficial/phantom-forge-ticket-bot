@@ -44,7 +44,10 @@ const client = new Client({
 
 const creatingTicket = new Set();
 const transcripts = new Map();
-let lastStatusMessage = null;
+
+// === STATUS CACHE ===
+let lastStatusMessageId = null;
+let lastStatusMessageObj = null;
 let statusEditing = false;
 
 // === HELPERS ===
@@ -132,26 +135,70 @@ async function createPanel(i) {
   await i.editReply('✅ Ticket panel created.');
 }
 
-// === LIVE STATUS EMBED (styled like screenshot) ===
+// === STATUS HANDLING ===
 async function ensureStatusMessage() {
-  if (lastStatusMessage) return lastStatusMessage;
-  const channel = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== ChannelType.GuildText) return null;
-  const msg = await channel.send({ embeds: [new EmbedBuilder().setDescription('Starting...')] });
-  lastStatusMessage = msg;
-  return msg;
+  // gebruik cache als geldig
+  if (lastStatusMessageObj && !lastStatusMessageObj.deleted) return lastStatusMessageObj;
+
+  const ch = await client.channels.fetch(STATUS_CHANNEL_ID).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) return null;
+
+  // fetch via ID
+  if (lastStatusMessageId) {
+    const msg = await ch.messages.fetch(lastStatusMessageId).catch(() => null);
+    if (msg) { lastStatusMessageObj = msg; return msg; }
+  }
+
+  // zoek bestaande van bot
+  const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+  if (recent && recent.size) {
+    const mine = [...recent.values()].filter(m =>
+      m.author?.id === client.user.id &&
+      m.embeds?.[0]?.title?.includes('Bot Status')
+    );
+
+    if (mine.length) {
+      mine.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+      const newest = mine[0];
+      lastStatusMessageObj = newest;
+      lastStatusMessageId = newest.id;
+
+      // verwijder duplicaten
+      const dups = mine.slice(1);
+      for (const d of dups) d.delete().catch(() => {});
+      return newest;
+    }
+  }
+
+  // niks gevonden, maak nieuw
+  const placeholder = new EmbedBuilder()
+    .setColor('#8000ff')
+    .setTitle(`🕒 ${client.user.username} Bot Status`)
+    .setDescription('Starting…')
+    .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() })
+    .setTimestamp();
+
+  const newMsg = await ch.send({ embeds: [placeholder] }).catch(() => null);
+  if (newMsg) {
+    lastStatusMessageObj = newMsg;
+    lastStatusMessageId = newMsg.id;
+    return newMsg;
+  }
+  return null;
 }
 
+// === POST STATUS (Live embed) ===
 async function postStatus() {
   if (!STATUS_CHANNEL_ID || statusEditing) return;
   statusEditing = true;
+
   try {
     const msg = await ensureStatusMessage();
     if (!msg) return;
 
     const active = client.isReady();
     const uptime = formatUptime(client.uptime ?? 0);
-    const ping = Math.round(client.ws.ping);
+    const ping = Math.max(0, Math.round(client.ws.ping));
     const now = new Date().toLocaleString('en-US');
     const title = `🕒 ${client.user.username} Bot Status`;
 
@@ -164,14 +211,12 @@ async function postStatus() {
         { name: 'Ping', value: `${ping} ms`, inline: true },
         { name: 'Last update', value: now, inline: false },
       )
-      .setFooter({
-        text: 'Live updated every second | Phantom Forge',
-        iconURL: client.user.displayAvatarURL()
-      })
+      .setFooter({ text: 'Live updated every second | Phantom Forge', iconURL: client.user.displayAvatarURL() })
       .setTimestamp();
 
     await msg.edit({ embeds: [embed] }).catch(async () => {
-      lastStatusMessage = null;
+      lastStatusMessageObj = null;
+      lastStatusMessageId = null;
       const again = await ensureStatusMessage();
       if (again) await again.edit({ embeds: [embed] }).catch(() => {});
     });
